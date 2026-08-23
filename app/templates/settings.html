@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Settings - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <a class="back-link" href="/dashboard">Torna alla dashboard</a>
+          <h1>Street Skate · Settings</h1>
+          <p>Provider: <strong>{{ user.provider_label }}</strong></p>
+        </div>
+        <div class="header-actions">
+          <a class="header-link" href="/admin/route-types">Tipologia percorsi</a>
+          <a class="header-link" href="/admin/logs">Log azioni</a>
+          <a class="header-link" href="/admin/request-debug">Debug richiesta</a>
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Logout</button>
+          </form>
+        </div>
+      </div>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Punteggi Street Skate</h2>
+            <p>I punteggi vengono calcolati con l'algoritmo base e restano fissi una volta salvati sul percorso.</p>
+          </div>
+        </div>
+        <div class="gpx-upload-state">I pesi difficoltà non sono modificabili dalla dashboard admin.</div>
+      </section>
+
+      {% if providers.adidas.export_available %}
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>adidas export locale</h2>
+            <p>Usa i file GPX/JSON già presenti in locale senza aprire la pagina di login del provider.</p>
+          </div>
+        </div>
+        <a class="export-link" href="/auth/adidas/export">Accedi con export locale</a>
+      </section>
+      {% endif %}
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Pulsanti autenticazione provider</h2>
+            <p>Controlla se il pulsante di login di ciascun provider deve essere visibile nella home e se deve risultare cliccabile.</p>
+          </div>
+          <button id="saveProviderButtons" type="button">Salva provider</button>
+        </div>
+        <div class="route-type-table-wrap">
+          <table class="route-type-table provider-button-table">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Secrets</th>
+                <th>Visibile</th>
+                <th>Abilitato</th>
+              </tr>
+            </thead>
+            <tbody id="providerButtonsBody">
+              <tr>
+                <td colspan="4">Caricamento...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Controllo duplicati GPX</h2>
+            <p>Configura tolleranze su distanza, estremi e percorso invertito.</p>
+          </div>
+          <button id="saveDuplicateSettings" type="button">Salva controlli</button>
+        </div>
+        <div class="dup-grid">
+          <label class="dup-card">
+            <span>Differenza distanza totale max</span>
+            <input id="dupDistanceDiffPct" type="number" min="0" max="100" step="0.1">
+            <strong><span id="dupDistanceDiffPctValue">5</span>%</strong>
+          </label>
+          <label class="dup-card">
+            <span>Tolleranza estremi tracciato</span>
+            <input id="dupEndpointToleranceM" type="number" min="0" max="5000" step="10">
+            <strong><span id="dupEndpointToleranceMValue">300</span> m</strong>
+          </label>
+          <label class="dup-card dup-card-toggle">
+            <span>Controlla percorso invertito</span>
+            <input id="dupAllowReverseMatch" type="checkbox">
+            <strong id="dupAllowReverseMatchValue">Attivo</strong>
+          </label>
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Calcolo pendenze</h2>
+            <p>Regola smoothing quota, lunghezza minima del tratto e cap massimo.</p>
+          </div>
+          <button id="saveSlopeSettings" type="button">Salva pendenze</button>
+        </div>
+        <div class="dup-grid">
+          <label class="dup-card">
+            <span>Finestra smoothing quota</span>
+            <input id="slopeSmoothingWindow" type="number" min="1" max="21" step="1">
+            <strong><span id="slopeSmoothingWindowValue">5</span> punti</strong>
+          </label>
+          <label class="dup-card">
+            <span>Lunghezza minima tratto</span>
+            <input id="slopeMinRunDistanceM" type="number" min="1" max="500" step="1">
+            <strong><span id="slopeMinRunDistanceMValue">20</span> m</strong>
+          </label>
+          <label class="dup-card">
+            <span>Cap pendenza massima</span>
+            <input id="slopeMaxCapPct" type="number" min="1" max="100" step="1">
+            <strong><span id="slopeMaxCapPctValue">35</span>%</strong>
+          </label>
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Audit log</h2>
+            <p>Ultime azioni registrate dal sistema.</p>
+          </div>
+          <button id="refreshAuditLogs" type="button">Aggiorna log</button>
+        </div>
+        <div class="audit-wrap">
+          <table class="audit-table">
+            <thead>
+              <tr>
+                <th>Quando</th>
+                <th>Azione</th>
+                <th>Soggetto</th>
+                <th>Errore</th>
+              </tr>
+            </thead>
+            <tbody id="auditLogsBody">
+              <tr>
+                <td colspan="4">Caricamento...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="toolbar">
+        <span id="statusText"></span>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:17
+    container_name: street_skate_db
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Rome
+      PGTZ: Europe/Rome
+      POSTGRES_DB: ${POSTGRES_DB:-street_skate}
+      POSTGRES_USER: ${POSTGRES_USER:-street_skate}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    command: ["postgres", "-c", "timezone=Europe/Rome", "-c", "log_timezone=Europe/Rome"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init/001-init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+      - ./docker/secrets:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-street_skate} -d ${POSTGRES_DB:-street_skate}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    container_name: street_skate_web
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      TZ: Europe/Rome
+      APP_ENV: production
+      UVICORN_RELOAD: "false"
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://street_skate:street_skate@db:5432/street_skate}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      APP_SECRET_KEY_FILE: /run/secrets/app_secret_key
+      ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      STRAVA_CLIENT_SECRET_FILE: /run/secrets/strava_client_secret
+      MAPMYRUN_CLIENT_SECRET_FILE: /run/secrets/mapmyrun_client_secret
+      SUUNTO_CLIENT_SECRET_FILE: /run/secrets/suunto_client_secret
+      SUUNTO_SUBSCRIPTION_KEY_FILE: /run/secrets/suunto_subscription_key
+      RUNKEEPER_CLIENT_SECRET_FILE: /run/secrets/runkeeper_client_secret
+      GARMIN_CLIENT_SECRET_FILE: /run/secrets/garmin_client_secret
+      INLINE_ROUTE_TRACKING_CLIENT_SECRET_FILE: /run/secrets/inline_route_tracking_client_secret
+      ADIDAS_CLIENT_SECRET_FILE: /run/secrets/adidas_client_secret
+      BASE_URL: ${BASE_URL:-https://streetskate.create-to-live.com}
+      HOST: 0.0.0.0
+      PORT: 5000
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./docker/secrets:/run/secrets:ro
+
+volumes:
+  pgdata:

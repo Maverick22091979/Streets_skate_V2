@@ -1,0 +1,16 @@
+docker/secrets/*
+!docker/secrets/.gitkeep
+
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+__pycache__/
+*.py[cod]
+
+data/export/
+com.runtastic.android-*.jadx
+*.apk
+
+artifacts/manuale_utente_street_skate_updated.docx

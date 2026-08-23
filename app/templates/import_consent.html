@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Consenso import - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <h1>Street Skate · Consenso import percorsi</h1>
+          <p>Utente: <strong>{{ user.provider_label }}</strong></p>
+        </div>
+        <div class="header-actions">
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Logout</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="notice">
+        Prima di aprire la dashboard, Street Skate chiede il consenso a scaricare e salvare nel database i percorsi del tuo account per ampliare il bacino dati disponibile nell'app.
+      </div>
+
+      {% if profile.warning %}
+      <div class="notice consent-warning">{{ profile.warning }}</div>
+      {% endif %}
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Campi baseline adidas Running</h2>
+            <p>{{ profile.summary }}</p>
+          </div>
+        </div>
+        <div class="consent-chips">
+          {% for item in profile.baseline_fields %}
+          <span>{{ item }}</span>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Dati importabili da {{ user.provider_label }}</h2>
+          </div>
+        </div>
+        <ul class="consent-list">
+          {% for item in profile.importable_fields %}
+          <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+
+      {% if profile.differences %}
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Differenze rispetto ad adidas Running</h2>
+          </div>
+        </div>
+        <div class="route-type-table-wrap">
+          <table class="route-type-table">
+            <thead>
+              <tr>
+                <th>Campo</th>
+                <th>adidas Running</th>
+                <th>{{ user.provider_label }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in profile.differences %}
+              <tr>
+                <td>{{ row.field }}</td>
+                <td>{{ row.adidas }}</td>
+                <td>{{ row.provider }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {% endif %}
+
+      {% if profile.missing_fields %}
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Dati non allineati o non disponibili</h2>
+          </div>
+        </div>
+        <ul class="consent-list">
+          {% for item in profile.missing_fields %}
+          <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+      {% endif %}
+
+      <section class="admin-panel">
+        <form method="post" action="/consent/import" class="consent-actions">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" name="action" value="accept">Accetto il download nel DB</button>
+          <button type="submit" name="action" value="decline" class="secondary-btn">Continua senza download</button>
+        </form>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

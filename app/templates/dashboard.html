@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Dashboard - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <h1>Street Skate · Dashboard percorsi</h1>
+          <p>Utente: <strong>{{ user.provider_label }}</strong></p>
+        </div>
+        <div class="header-actions">
+          {% if user.is_admin %}
+          <a class="header-link" href="/settings">Settings</a>
+          <a class="header-link" href="/admin/route-types">Tipologia percorsi</a>
+          <a class="header-link" href="/admin/logs">Log azioni</a>
+          <a class="header-link" href="/admin/request-debug">Debug richiesta</a>
+          {% endif %}
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Logout</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="notice">
+        I percorsi vengono importati dal provider connesso e salvati su Postgres. L'indice difficoltà usa pendenza max, pendenza media ponderata, pavimentazione, pressione atmosferica, temperatura e velocita massima storica sul tratto. I dati mancanti restano predisposti per arricchimento successivo.
+      </div>
+
+      {% if not user.is_admin and user.read_only %}
+      <div class="notice consent-warning">
+        Archivio globale in sola lettura. Dopo il login provider puoi consultare tutti i percorsi e i relativi punteggi, ma import e cancellazione restano riservati all'admin.
+      </div>
+      {% elif not user.is_admin and not user.import_allowed %}
+      <div class="notice consent-warning">
+        Download percorsi non autorizzato per questa sessione. La dashboard resta accessibile ma l'import da {{ user.provider_label }} è disabilitato.
+      </div>
+      {% endif %}
+
+      <div class="toolbar">
+        <button id="importRoutes" data-provider="{{ user.provider_key }}" data-read-only="{{ 'true' if user.read_only else 'false' }}" data-import-allowed="{{ 'true' if user.is_admin or user.import_allowed else 'false' }}" data-import-autostart="{{ 'true' if user.import_autostart else 'false' }}" {% if user.read_only or (not user.is_admin and not user.import_allowed) %}disabled{% endif %}>
+          {% if user.provider_key == "admin" %}Import non disponibile{% elif user.read_only %}Archivio in sola lettura{% elif not user.import_allowed %}Import disabilitato{% else %}Importa da {{ user.provider_label }}{% endif %}
+        </button>
+        <button id="reloadRoutes">Ricarica cache locale</button>
+        <span id="statusText">Caricamento...</span>
+      </div>
+
+      <div id="routesProgress" class="routes-progress" aria-live="polite">
+        <div class="routes-progress-top">
+          <span id="routesProgressLabel">Percorsi trovati</span>
+          <strong id="routesProgressValue">0 / 0</strong>
+        </div>
+        <div class="routes-progress-bar">
+          <progress id="routesProgressFill" max="100" value="0">0%</progress>
+        </div>
+      </div>
+
+      {% if user.is_admin %}
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Import GPX</h2>
+            <p>Carica percorsi manuali e aggiorna la cache locale.</p>
+          </div>
+        </div>
+        <form id="gpxUploadForm" class="gpx-upload" method="post" enctype="multipart/form-data" action="/dashboard/import-gpx">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input id="gpxFiles" type="file" name="files" accept=".gpx,.json" multiple>
+          <button id="uploadGpx" type="submit">Importa GPX + JSON</button>
+        </form>
+        <div id="gpxProgress" class="gpx-progress hidden" aria-live="polite">
+          <div class="gpx-progress-top">
+            <span id="gpxProgressLabel">Import GPX</span>
+            <strong id="gpxProgressValue">0%</strong>
+          </div>
+          <div class="gpx-progress-bar">
+            <progress id="gpxProgressFill" max="100" value="0">0%</progress>
+          </div>
+        </div>
+        <div id="gpxUploadState" class="gpx-upload-state">{{ gpx_status or "Nessun import GPX avviato" }}</div>
+      </section>
+      {% endif %}
+
+      <div class="summary-grid" id="summaryGrid"></div>
+      <section class="dashboard-content">
+        <aside class="filters-sidebar">
+          <section class="filters-panel">
+            <div class="filters-head">
+              <h2>Filtri percorsi</h2>
+              <button id="resetFilters" type="button">Reset filtri</button>
+            </div>
+            <div id="filtersGrid" class="filters-grid">
+              {% if user.is_admin or user.read_only %}
+              <label class="filter-card">
+                <span>Utente importatore</span>
+                <select id="userFilter" class="filter-input" data-key="import_user_id">
+                  <option value="">Tutti</option>
+                </select>
+                <small class="filter-range">Utenti con almeno un percorso importato</small>
+              </label>
+              {% endif %}
+              <label class="filter-card">
+                <span>Difficoltà dichiarata</span>
+                <select id="declaredDifficultyFilter" class="filter-input" data-key="declared_difficulty_level">
+                  <option value="">Tutte</option>
+                  <option value="Easy">Easy</option>
+                  <option value="EasyLong">EasyLong</option>
+                  <option value="Advanced">Advanced</option>
+                  <option value="Pro">Pro</option>
+                  <option value="Unknown">Unknown</option>
+                </select>
+                <small class="filter-range">Classificazione iniziale da calendario</small>
+              </label>
+              <label class="filter-card">
+                <span>Distanza km</span>
+                <input class="filter-input" data-key="distance_km" data-mode="max" type="number" step="0.1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Dislivello m</span>
+                <input class="filter-input" data-key="elevation_gain_m" data-mode="max" type="number" step="1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Velocità max km/h</span>
+                <input class="filter-input" data-key="segment_max_speed_kmh" data-mode="max" type="number" step="0.1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Velocità media km/h</span>
+                <input class="filter-input" data-key="average_speed_kmh" data-mode="max" type="number" step="0.1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Pendenza max assoluta %</span>
+                <input class="filter-input" data-key="max_slope_pct" data-mode="max" type="number" step="0.1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Pendenza media ponderata assoluta %</span>
+                <input class="filter-input" data-key="weighted_avg_slope_pct" data-mode="max" type="number" step="0.1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Sampietrini</span>
+                <select id="cobblestoneFilter" class="filter-input" data-key="has_cobblestone">
+                  <option value="">Tutti</option>
+                  <option value="false">No</option>
+                  <option value="true">Si</option>
+                </select>
+                <small class="filter-range">Derivato da OSM surface=cobblestone/sett</small>
+              </label>
+              <label class="filter-card">
+                <span>Pendenza media %</span>
+                <input class="filter-input" data-key="avg_grade_pct" data-mode="max" type="number" step="0.1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+              <label class="filter-card">
+                <span>Score difficoltà</span>
+                <input class="filter-input" data-key="difficulty_score" data-mode="max" type="number" step="1" placeholder="max">
+                <small class="filter-range">Range: n.d.</small>
+              </label>
+            </div>
+          </section>
+        </aside>
+        <div id="routesGrid" class="routes-grid"></div>
+      </section>
+    </section>
+  </main>
+
+  <script id="initialRoutesData" type="application/json">{{ initial_routes | tojson }}</script>
+  <script id="initialUsersData" type="application/json">{{ initial_users | tojson }}</script>
+  {% if not user.is_admin and not user.read_only %}
+  <div id="importConsentModal" class="consent-modal{% if user.import_consent != 'pending' %} hidden{% endif %}">
+    <div class="consent-modal-backdrop"></div>
+    <div class="consent-modal-card">
+      <h2>Autorizzazione download percorsi</h2>
+      <p>Per ampliare il bacino dati dell'app, Street Skate può scaricare e salvare nel database i tuoi percorsi da {{ user.provider_label }}.</p>
+      <p>{{ import_profile.summary }}</p>
+
+      <div class="consent-modal-section">
+        <h3>Campi baseline adidas Running</h3>
+        <div class="consent-chips">
+          {% for item in import_profile.baseline_fields %}
+          <span>{{ item }}</span>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="consent-modal-section">
+        <h3>Dati importabili da {{ user.provider_label }}</h3>
+        <ul class="consent-list">
+          {% for item in import_profile.importable_fields %}
+          <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      {% if import_profile.differences %}
+      <div class="consent-modal-section">
+        <h3>Differenze rispetto ad adidas Running</h3>
+        <div class="route-type-table-wrap">
+          <table class="route-type-table">
+            <thead>
+              <tr>
+                <th>Campo</th>
+                <th>adidas Running</th>
+                <th>{{ user.provider_label }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in import_profile.differences %}
+              <tr>
+                <td>{{ row.field }}</td>
+                <td>{{ row.adidas }}</td>
+                <td>{{ row.provider }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if import_profile.missing_fields %}
+      <div class="consent-modal-section">
+        <h3>Dati non allineati o non disponibili</h3>
+        <ul class="consent-list">
+          {% for item in import_profile.missing_fields %}
+          <li>{{ item }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+
+      {% if import_profile.warning %}
+      <div class="notice consent-warning">{{ import_profile.warning }}</div>
+      {% endif %}
+
+      <form method="post" action="/consent/import" class="consent-actions">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" name="action" value="accept">Accetto l'import</button>
+        <button type="submit" name="action" value="decline" class="secondary-btn">Rifiuto l'import</button>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+  <footer id="importFooterCounter" class="import-footer-counter hidden" aria-live="polite">
+    <span id="importFooterLabel">Import percorsi</span>
+    <strong id="importFooterValue">[0 / 0]</strong>
+  </footer>
+  <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Tipologia percorsi - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <a class="back-link" href="/settings">Torna alle settings</a>
+          <h1>Street Skate · Tipologia percorsi</h1>
+          <p>Utente: <strong>{{ user.provider_label }}</strong></p>
+        </div>
+        <div class="header-actions">
+          <a class="header-link" href="/dashboard">Dashboard</a>
+          <a class="header-link" href="/admin/logs">Log azioni</a>
+          <a class="header-link" href="/admin/request-debug">Debug richiesta</a>
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Logout</button>
+          </form>
+        </div>
+      </div>
+
+      {% if status %}
+      <div class="notice">{{ status }}</div>
+      {% endif %}
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Modifica tipologia percorso</h2>
+            <p>Cerca un percorso e aggiorna il campo tipologia salvato nel database.</p>
+          </div>
+        </div>
+        <form method="get" action="/admin/route-types" class="route-type-search">
+          <input type="text" name="q" value="{{ q }}" placeholder="Cerca per nome, utente, tipologia o id">
+          <button type="submit">Filtra</button>
+        </form>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Elenco percorsi</h2>
+            <p>{{ rows|length }} percorsi visibili con il filtro corrente.</p>
+          </div>
+        </div>
+        <div class="route-type-table-wrap">
+          <table class="route-type-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Percorso</th>
+                <th>Utente</th>
+                <th>Data</th>
+                <th>Sorgente</th>
+                <th>Tipologia</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in rows %}
+              <tr>
+                <td>{{ row.id }}</td>
+                <td>{{ row.name }}</td>
+                <td>{{ row.import_user_label }}</td>
+                <td>{{ row.start_date_local }}</td>
+                <td>
+                  <div class="route-source-cell">
+                    <span class="source-chip source-chip-{{ row.storage_source.kind }}">{{ row.storage_source.label }}</span>
+                    <small>{{ row.storage_source.detail }}</small>
+                  </div>
+                </td>
+                <td>
+                  <form id="routeTypeForm{{ row.id }}" method="post" action="/admin/route-types/{{ row.id }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  </form>
+                  <div class="route-type-cell">
+                    <small>Valore salvato nel DB Street Skate</small>
+                  <select name="sport_type" form="routeTypeForm{{ row.id }}">
+                      {% for item in row.type_choices %}
+                      <option value="{{ item }}" {% if item == row.sport_type %}selected{% endif %}>{{ item }}</option>
+                      {% endfor %}
+                  </select>
+                  </div>
+                </td>
+                <td>
+                  <button type="submit" form="routeTypeForm{{ row.id }}">Salva</button>
+                </td>
+              </tr>
+              {% endfor %}
+              {% if not rows %}
+              <tr>
+                <td colspan="7" class="audit-empty">Nessun percorso trovato</td>
+              </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

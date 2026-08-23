@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Debug richiesta - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <a class="back-link" href="/settings">Torna alle settings</a>
+          <h1>Street Skate · Debug richiesta</h1>
+          <p>Utente: <strong>{{ user.provider_label }}</strong></p>
+        </div>
+        <div class="header-actions">
+          <a class="header-link" href="/dashboard">Dashboard</a>
+          <a class="header-link" href="/admin/logs">Log azioni</a>
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Logout</button>
+          </form>
+        </div>
+      </div>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Diagnostica header e client</h2>
+            <p>Apri questa pagina da PC e da Android tramite Funnel per confrontare IP, header di forwarding e user-agent ricevuti da FastAPI.</p>
+          </div>
+        </div>
+        <div class="route-type-table-wrap">
+          <table class="route-type-table">
+            <tbody>
+              <tr><th>Client host</th><td>{{ payload.client_host or "n.d." }}</td></tr>
+              <tr><th>Client port</th><td>{{ payload.client_port or "n.d." }}</td></tr>
+              <tr><th>Metodo</th><td>{{ payload.method }}</td></tr>
+              <tr><th>URL</th><td>{{ payload.url }}</td></tr>
+              <tr><th>Base URL</th><td>{{ payload.base_url }}</td></tr>
+              <tr><th>X-Forwarded-For</th><td>{{ payload.headers["x-forwarded-for"] or "n.d." }}</td></tr>
+              <tr><th>Forwarded</th><td>{{ payload.headers["forwarded"] or "n.d." }}</td></tr>
+              <tr><th>X-Real-IP</th><td>{{ payload.headers["x-real-ip"] or "n.d." }}</td></tr>
+              <tr><th>CF-Connecting-IP</th><td>{{ payload.headers["cf-connecting-ip"] or "n.d." }}</td></tr>
+              <tr><th>X-Forwarded-Proto</th><td>{{ payload.headers["x-forwarded-proto"] or "n.d." }}</td></tr>
+              <tr><th>X-Forwarded-Host</th><td>{{ payload.headers["x-forwarded-host"] or "n.d." }}</td></tr>
+              <tr><th>User-Agent</th><td>{{ payload.headers["user-agent"] or "n.d." }}</td></tr>
+              <tr><th>Referer</th><td>{{ payload.headers["referer"] or "n.d." }}</td></tr>
+              <tr><th>Origin</th><td>{{ payload.headers["origin"] or "n.d." }}</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Tutti gli header ricevuti</h2>
+            <p>Dump completo utile per capire se Tailscale Funnel inoltra l'IP reale del client tramite qualche header aggiuntivo.</p>
+          </div>
+        </div>
+        <pre>{{ payload.all_headers | tojson(indent=2) }}</pre>
+      </section>
+    </section>
+  </main>
+</body>
+</html>
