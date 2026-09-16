@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Supporta {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="login-page">
+    <section class="login-card support-card">
+      <a class="back-link" href="/dashboard">Torna alla dashboard</a>
+      <div class="brand">
+        <div class="brand-icon">SS</div>
+        <div><h1>Supporta Street Skate</h1><p>Un contributo volontario aiuta a coprire infrastruttura e integrazioni provider.</p></div>
+      </div>
+      {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+      {% if status %}<div class="gpx-upload-state">{{ status }}</div>{% endif %}
+      {% if paid %}
+      <p class="support-note">Il pagamento risulta confermato da Stripe.</p>
+      {% elif configured %}
+      <form class="admin-form" method="post" action="/support/checkout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Continua con Stripe</button>
+      </form>
+      <p class="support-note">Il pagamento viene gestito interamente nella pagina sicura di Stripe.</p>
+      {% else %}
+      <p class="support-note">Il supporto Stripe non è ancora configurato.</p>
+      {% endif %}
+    </section>
+  </main>
+  <script src="/static/js/session-guard.js?v={{ asset_version }}" data-session-guard data-csrf="{{ csrf_token }}" data-timeout="{{ session_inactivity_timeout_sec }}"></script>
+</body>
+</html>

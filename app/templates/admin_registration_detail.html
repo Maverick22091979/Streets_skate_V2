@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Dettaglio richiesta - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <a class="back-link" href="/admin/registrations">Torna alle richieste</a>
+          <h1>Street Skate · Richiesta #{{ registration.id }}</h1>
+          <p>Notifiche pendenti: <strong>{{ pending_registration_count }}</strong></p>
+        </div>
+        <div class="header-actions">
+          <a class="header-link" href="/dashboard">Dashboard</a>
+          <a class="header-link" href="/settings">Settings</a>
+          {% if user.can_change_password %}
+          <a class="header-link" href="/account/password">Cambio password</a>
+          {% endif %}
+          <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Logout</button>
+          </form>
+        </div>
+      </div>
+
+      {% if status %}
+      <div class="notice">{{ status }}</div>
+      {% endif %}
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Ambito: Nuovo utente</h2>
+            <p>Form omologo ai dati inseriti dal richiedente.</p>
+          </div>
+        </div>
+        <div class="registration-detail-grid">
+          <div class="dup-card"><span>Nome</span><strong>{{ registration.first_name }}</strong></div>
+          <div class="dup-card"><span>Cognome</span><strong>{{ registration.last_name }}</strong></div>
+          <div class="dup-card"><span>Username</span><strong>{{ registration.username }}</strong></div>
+          <div class="dup-card"><span>Data di nascita</span><strong>{{ registration.birth_date or 'n.d.' }}</strong></div>
+          <div class="dup-card"><span>Email</span><strong>{{ registration.email }}</strong></div>
+          <div class="dup-card"><span>Telefono</span><strong>{{ registration.phone }}</strong></div>
+          <div class="dup-card"><span>Stato</span><strong>{{ registration.status_label }}</strong></div>
+          <div class="dup-card"><span>Richiesta il</span><strong>{{ registration.created_at }}</strong></div>
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Revisione admin</h2>
+            <p>In approvazione il sistema crea un account di ruolo skater/user e genera una password temporanea.</p>
+          </div>
+        </div>
+        <form class="registration-review-form" method="post" action="/admin/registrations/{{ registration.id }}/review">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>
+            Note admin
+            <textarea name="review_notes" rows="5" placeholder="Motivazione o note operative">{{ registration.review_notes }}</textarea>
+          </label>
+          {% if registration.status == 'pending' %}
+          <div class="registration-review-actions">
+            <button type="submit" name="action" value="approve">Approva</button>
+            <button type="submit" name="action" value="deny" class="danger-btn">Nega</button>
+          </div>
+          {% else %}
+          <div class="gpx-upload-state">Richiesta già lavorata.</div>
+          {% endif %}
+        </form>
+      </section>
+    </section>
+  </main>
+  <script src="/static/js/session-guard.js?v={{ asset_version }}" data-session-guard data-csrf="{{ csrf_token }}" data-timeout="{{ session_inactivity_timeout_sec }}"></script>
+</body>
+</html>

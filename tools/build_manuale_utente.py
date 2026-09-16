@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -14,7 +16,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 
 OUT = Path("artifacts/manuale_utente_street_skate.docx")
-FALLBACK_OUT = Path("artifacts/manuale_utente_street_skate_updated.docx")
+PDF_OUT = OUT.with_suffix(".pdf")
 LOGIN_IMG = Path("artifacts/manual_images/login.png")
 DASHBOARD_IMG = Path(r"C:\Users\giorg\Pictures\Screenshots\Screenshot 2026-07-26 143332.png")
 
@@ -68,6 +70,63 @@ def add_caption(doc: Document, text: str):
     r.font.name = "Calibri"
     r.font.size = Pt(9.5)
     r.font.color.rgb = RGBColor.from_string("475467")
+
+
+def add_contents(doc: Document):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(14)
+    p.paragraph_format.space_after = Pt(6)
+    r = p.add_run("Sommario")
+    r.font.name = "Calibri"
+    r.font.size = Pt(16)
+    r.font.bold = True
+    r.font.color.rgb = RGBColor.from_string("163A63")
+
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(6)
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = ' TOC \\o "1-3" \\h \\z \\u '
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for node in (begin, instruction, separate):
+        field_run = OxmlElement("w:r")
+        field_run.append(node)
+        p._p.append(field_run)
+    p.add_run("Aggiornare il sommario in Word per visualizzare capitoli, sottoparagrafi e pagine.")
+    field_run = OxmlElement("w:r")
+    field_run.append(end)
+    p._p.append(field_run)
+    doc.add_page_break()
+
+
+def enable_toc_update(doc: Document):
+    update = OxmlElement("w:updateFields")
+    update.set(qn("w:val"), "true")
+    doc.settings.element.append(update)
+
+
+def export_pdf():
+    soffice = shutil.which("soffice")
+    if not soffice:
+        candidate = Path(r"C:\Program Files\LibreOffice\program\soffice.exe")
+        soffice = str(candidate) if candidate.is_file() else ""
+    if not soffice:
+        raise RuntimeError("LibreOffice soffice non disponibile: impossibile creare il PDF.")
+
+    result = subprocess.run(
+        [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(OUT.parent), str(OUT)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode or not PDF_OUT.is_file():
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Esportazione PDF non riuscita. {details}")
 
 
 def style_doc(doc: Document):
@@ -131,8 +190,8 @@ def add_title(doc: Document):
     meta = doc.add_table(rows=3, cols=2)
     set_table_layout(meta, [1.8, 4.7])
     rows = [
-        ("Versione documento", "1.3"),
-        ("Data", date(2026, 8, 21).strftime("%d/%m/%Y")),
+        ("Versione documento", "4.1"),
+        ("Data", date(2026, 9, 16).strftime("%d/%m/%Y")),
         ("Ambito", "Web app FastAPI Street Skate con provider Strava, adidas Running, MapMyRun, Suunto, Runkeeper, Garmin, Inline Route Tracking e accesso Admin"),
     ]
     for i, (a, b) in enumerate(rows):
@@ -169,6 +228,12 @@ def add_overview(doc: Document):
     doc.add_paragraph(
         "Nel deploy pubblico corrente l'applicazione gira su VPS Aruba con Cloudflare davanti, nginx installato sull'host come reverse proxy HTTPS e container Docker dedicati a web e database."
     )
+    doc.add_paragraph(
+        "La schermata di login usa ora il titolo Street Skate e adatta la disposizione dei blocchi in base al device: layout esteso per desktop/tablet e layout compatto verticale per smartphone."
+    )
+    doc.add_paragraph(
+        "Se l'utente non possiede ancora un account locale e non usa un provider sportivo supportato, la home espone anche il link Registrati per inviare una richiesta di attivazione all'admin."
+    )
 
 
 def add_login_modes(doc: Document):
@@ -177,22 +242,34 @@ def add_login_modes(doc: Document):
     add_bullets(
         doc,
         [
-            "Strava: il pulsante apre la pagina ufficiale di login del provider; l'utente inserisce lì le credenziali e il backend completa l'autenticazione OAuth tramite callback e token API.",
+            "Strava: il pulsante apre la pagina ufficiale di login/autorizzazione del provider; l'utente inserisce lì le credenziali e il backend completa l'autenticazione OAuth tramite callback e token API.",
+            "Se nel browser è già aperta una sessione Strava, il provider può riutilizzarla e mostrare subito il consenso senza ripresentare il form credenziali. Per test con un altro account conviene usare logout da Strava, finestra anonima o profilo browser separato.",
             "MapMyRun: se configurato, il pulsante apre la pagina ufficiale di login del provider; l'app non legge username e password ma riceve il token API dopo il consenso OAuth.",
             "Suunto: il provider e predisposto nel progetto, ma al 19 agosto 2026 la richiesta partnership risulta inviata e in review da parte di Suunto, con finestra indicativa di risposta entro circa il 2 settembre 2026.",
             "Runkeeper: il provider e predisposto come integrazione legacy e va verificato sul campo prima di un uso reale.",
             "Garmin Connect: il supporto nel progetto è predisposto, ma al 3 agosto 2026 i servizi API Garmin risultano in migrazione secondo il team developer Garmin e non è stata comunicata una data di ripristino. L'attivazione reale resta quindi bloccata anche in presenza della configurazione locale.",
             "Inline Route Tracking: il provider è già predisposto nella schermata di login rapido ma resta in attesa delle API ufficiali di login/auth e dello schema callback dell'app Android.",
             "adidas Running: il pulsante provider è riservato al login ufficiale OAuth; se l'OAuth non è configurato ma l'export locale è disponibile, l'accesso tramite export compare come azione separata.",
+            "Sotto al form di accesso locale è presente il link Registrati: apre una pagina pubblica con nome, cognome, username, data di nascita, email e telefono, registrando una richiesta pendente per l'admin.",
             "Dopo un login utente riuscito, all'apertura della dashboard compare un popup di consenso download percorsi nel database della web app.",
+            "Su desktop e tablet i pulsanti provider sono disposti lungo una fascia orizzontale senza didascalie interne; le informazioni di stato dei provider sono raccolte in un pannello dedicato sotto la fascia, sulla destra.",
+            "Su smartphone il layout resta verticale e proporzionato allo schermo, mantenendo la leggibilità dei pulsanti e dei blocchi informativi.",
         ],
     )
-    doc.add_heading("2.2 Accesso Admin locale", level=2)
+    doc.add_heading("2.2 Accesso locale admin e skater", level=2)
     add_bullets(
         doc,
         [
-            "L'admin accede con username e password locali definiti nel file .env.",
-            "L'admin non usa provider esterni per autenticarsi.",
+            "L'accesso locale usa username e password applicative, senza passare da provider esterni.",
+            "L'admin bootstrap puo ancora essere definito nel file .env, ma dalla sezione admin e possibile creare ulteriori utenze locali di ruolo admin o skater.",
+            "Per ogni utenza locale creata vengono registrati anche email di riferimento e numero di cellulare, predisposti per futuri flussi OTP e 2FA.",
+            "Gli account locali di ruolo admin aprono la dashboard amministrativa completa.",
+            "Gli account locali di ruolo skater accedono all'archivio globale in sola lettura, come gli utenti provider.",
+            "Le richieste inviate dalla pagina Registrati non creano subito l'account: entrano prima nella coda admin di approvazione nuovi utenti.",
+            "Alla creazione dell'utenza il backend genera una password casuale di primo accesso e tenta di inviarla via email tramite Resend all'indirizzo associato all'utente.",
+            "Se l'invio mail non riesce, l'admin riceve comunque un messaggio di fallback con la password temporanea per poterla comunicare manualmente.",
+            "Quando una richiesta pubblica viene approvata, il sistema crea sempre un account di ruolo skater/user e imposta la richiesta su Eseguita: utenza creata. Solo dopo la conferma nel database tenta l'invio della mail di approvazione con password temporanea.",
+            "Quando una richiesta pubblica viene negata, il sistema può inviare una mail dedicata con esito negativo e note admin opzionali.",
             "Il login admin applica una protezione anti brute force in memoria: dopo 5 tentativi falliti nella finestra corrente, l'accesso viene bloccato temporaneamente per 15 minuti per combinazione IP/username.",
             "Una volta loggato visualizza tutti i percorsi presenti in archivio, non solo quelli di un singolo utente.",
         ],
@@ -206,17 +283,22 @@ def add_login_modes(doc: Document):
             "Per l'admin la sessione salva il contesto local_admin.",
             "Con la configurazione corrente i login provider aprono l'archivio globale in sola lettura: tutti i percorsi e i relativi punteggi sono visibili, ma import e cancellazioni restano riservati all'admin.",
             "Il logout cancella la sessione locale e, per i provider che supportano una revoca ufficiale via API, tenta anche la chiusura della sessione/token lato provider prima di registrare l'evento nell'audit log.",
-            "Le sessioni autenticate registrano timestamp di avvio e ultimo utilizzo; con la configurazione corrente, se l'utente resta inattivo per oltre 3 minuti la sessione viene invalidata e deve rifare login.",
+            "Le sessioni autenticate registrano timestamp di avvio e ultimo utilizzo; un timer lato browser e il controllo lato server invalidano la sessione dopo 3 minuti di inattività e richiedono un nuovo login. Il timeout resta sospeso mentre e attiva una richiesta applicativa interna, inclusi upload GPX/JSON, import provider e polling di avanzamento.",
+            "Alla chiusura della scheda il browser invia un segnale di logout al backend; il server cancella la sessione e registra session_tab_closed nell'audit log. Il segnale usa il ciclo di vita del browser e resta affiancato al timeout server come protezione di fallback.",
             "Con la configurazione corrente il cookie di sessione è non persistente: alla chiusura del browser la sessione lato client decade e il login va ripetuto alla riapertura.",
             "Dopo il logout, la pagina iniziale riporta i pulsanti provider a un nuovo ciclo di login, così il click successivo riparte dal flusso di autenticazione del provider relativo.",
             "Le credenziali del provider non transitano nell'app Street Skate: vengono inserite nella pagina ufficiale del provider e l'app riceve solo code/token di autenticazione.",
             "Nella schermata di login ogni provider mostra lo stato corrente di implementazione per Login, Auth e Settings Secrets.",
             "La schermata di login non espone più password di configurazione nei placeholder e le variabili sensibili devono essere valorizzate solo tramite file ambiente o secret manager.",
             "Lo sviluppo locale usa il file .env con callback localhost, mentre il deploy VPS usa un file separato .env.production con BASE_URL pubblico e redirect URI coerenti con il dominio pubblicato.",
+            "Nel deploy VPS i secret sensibili non devono stare nel repository Git: il progetto supporta file sotto docker/secrets montati come /run/secrets, con priorita rispetto ai valori omonimi presenti nei file ambiente.",
             "I cookie di sessione sono configurabili via ambiente; in produzione il flag Secure deve restare attivo dietro HTTPS, mentre in sviluppo locale può restare disattivato per localhost.",
             "Le operazioni mutanti via form e via fetch usano un token CSRF di sessione, verificato dal backend prima di accettare login admin, logout, import, cancellazioni e salvataggi amministrativi.",
             "Il backend invia header HTTP di hardening come Content-Security-Policy, X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy e header cross-origin restrittivi; HSTS va attivato solo nel deploy HTTPS pubblico.",
             "Lo script della pagina dettaglio percorso è stato spostato in un file statico dedicato, così la CSP può evitare unsafe-inline per gli script applicativi.",
+            "Nel footer della login vengono mostrate le note operative già presenti e un timestamp corrente in basso a destra, utile per distinguere la build e il momento di caricamento della pagina.",
+            "Se un utente locale entra con password temporanea, viene reindirizzato obbligatoriamente a una pagina di cambio password prima di poter usare dashboard o sezione admin.",
+            "Gli utenti locali con password già definitiva possono aprire in qualsiasi momento la sezione Cambio password e, dopo autenticazione valida, tornano poi in dashboard.",
         ],
     )
 
@@ -230,7 +312,7 @@ def add_screenshots(doc: Document):
     if LOGIN_IMG.exists():
         doc.add_heading("3.1 Login", level=2)
         doc.add_picture(str(LOGIN_IMG), width=Inches(4.4))
-        add_caption(doc, "Schermata login con accesso provider e accesso Admin locale.")
+        add_caption(doc, "Schermata login con accesso provider e accesso locale admin/skater.")
 
     if DASHBOARD_IMG.exists():
         doc.add_heading("3.2 Dashboard percorsi", level=2)
@@ -246,7 +328,9 @@ def add_user_dashboard(doc: Document):
         [
             "Visualizzazione del nome utente/provider corrente nell'header.",
             "Al login provider, la dashboard carica subito dal database l'archivio globale dei percorsi, non solo quelli dell'utente autenticato.",
-            "Il pulsante Importa risulta disabilitato per i login provider, perché il catalogo globale e in sola lettura.",
+            "Ogni utente autenticato consulta quindi lo stesso archivio globale dei percorsi gia presenti nel database.",
+            "Per Strava con scope activity:read_all, l'import parte automaticamente dopo il callback OAuth; senza tale scope il catalogo resta in sola lettura.",
+            "Pulsante Supporta: resta inattivo finché Stripe non è configurato con chiave segreta e Price ID; quando disponibile apre una pagina dedicata e avvia un pagamento volontario tramite Stripe Checkout.",
             "Pulsante Ricarica cache locale per rileggere l'archivio globale gia salvato nel database.",
             "Barra di avanzamento che indica i percorsi trovati nell'archivio globale.",
             "Cinque riquadri riepilogativi: numero percorsi, distanza totale, difficoltà media, percorsi difficili, ultima importazione.",
@@ -274,12 +358,13 @@ def add_user_dashboard(doc: Document):
     add_bullets(
         doc,
         [
-            "Ogni card mostra score e livello di difficoltà.",
+            "Ogni card e un riepilogo compatto e cliccabile: mostra score, livello di difficoltà, nome, tipo, data, distanza, dislivello, pendenza massima, velocità media, autore, provider e stato sintetico dei controlli traccia.",
             "Accanto al nome del percorso compare un indicatore circolare con il colore associato alla difficoltà dichiarata iniziale.",
-            "Sono presenti nome percorso, tipo attività, data locale, distanza, dislivello, velocità media, pendenza massima assoluta, verso della pendenza massima, superficie, presenza sampietrini, pressione, temperatura e fonte dei dati.",
-            "Ogni card include il nome dell'utente importatore registrato sul record.",
+            "Le metriche tecniche complete, il profilo pendenza, i controlli GPS/OSM estesi e la mappa sono disponibili nel dettaglio del singolo percorso.",
+            "Ogni card include il nome dell'autore o utente importatore registrato sul record.",
+            "Ogni card mostra anche il provider di origine del percorso e la sorgente archivio usata dal record, distinguendo DB live e DB locale.",
             "Nei login provider l'elenco e in sola lettura e non mostra il pulsante Cancella.",
-            "Il link sul nome apre il dettaglio del percorso.",
+            "Il click sulla card, oppure Invio o Spazio da tastiera, apre il dettaglio del percorso.",
         ],
     )
     doc.add_heading("4.4 Dettaglio percorso", level=2)
@@ -320,10 +405,11 @@ def add_import_logic(doc: Document):
     add_bullets(
         doc,
         [
-            "Dopo autenticazione utente riuscita, Street Skate mostra un popup/disclaimer in overlay sulla dashboard.",
-            "Il disclaimer chiede l'autorizzazione a scaricare e salvare nel DB i percorsi dell'utente.",
-            "Se l'utente accetta, l'import provider parte automaticamente in background e il footer mostra un conteggio realtime nel formato [percorsi importati / percorsi totali]. A completamento import, il messaggio finale resta visibile per 8 secondi e poi il footer si nasconde.",
-            "Se l'utente rifiuta, l'accesso alla dashboard è consentito ma l'import viene bloccato lato interfaccia e lato API.",
+            "Il consenso per Strava viene raccolto esclusivamente nella pagina ufficiale OAuth del provider, non tramite checkbox interne a Street Skate.",
+            "Per proseguire, nella pagina Strava deve essere concesso il permesso per tutte le attività private, corrispondente allo scope activity:read_all. Il profilo completo è facoltativo e non blocca l'import.",
+            "Dopo il callback OAuth con lo scope activity:read_all, Street Skate salva il consenso nella sessione e avvia automaticamente l'import Strava in background al primo caricamento della dashboard.",
+            "Il footer mostra il conteggio realtime [percorsi importati / percorsi totali]. A completamento import, il messaggio finale resta visibile per 8 secondi e poi il footer si nasconde.",
+            "Se Strava non concede activity:read_all, il login viene comunque completato: l'utente può consultare l'archivio globale Street Skate in sola lettura, ma l'import delle proprie attività non viene avviato.",
         ],
     )
 
@@ -348,6 +434,20 @@ def add_import_logic(doc: Document):
             "Calcolo indice difficoltà Street Skate basato sui pesi base dell'algoritmo.",
             "Per i file GPX con data riconoscibile nel nome, generazione di una difficoltà dichiarata iniziale da calendario eventi (Easy, EasyLong, Advanced, Pro).",
             "Registrazione di import_user_label per sapere quale utente ha eseguito il download/import.",
+        ],
+    )
+
+    doc.add_heading("5.3.1 Controllo integrità GPS e rete percorribile", level=3)
+    add_bullets(
+        doc,
+        [
+            "Per ogni nuovo percorso con punti GPS, Street Skate analizza le coppie di punti contigui e salva l'esito nel campo Integrità GPS.",
+            "Vengono segnalati segmenti consecutivi oltre 250 m, punti temporalmente coincidenti o invertiti distanti almeno 50 m, velocità calcolate oltre 65 km/h e lunghi salti con intervallo temporale di almeno 120 secondi.",
+            "Il controllo evidenzia possibili ricostruzioni rettilinee del provider dopo perdita GPS, come il collegamento tra ultimo punto valido e punto di riaggancio; non elimina automaticamente il percorso.",
+            "La traccia viene inoltre campionata e confrontata con OpenStreetMap: strade, piste ciclabili, sentieri, strade bianche e aree parco disponibili nella mappa OSM.",
+            "Il campo Coerenza rete OSM segnala un avviso quando oltre il 20% dei campioni risulta oltre 35 m dalla rete percorribile OSM. I campioni intermedi dei segmenti lunghi aiutano a rilevare possibili tagli di vie.",
+            "Un avviso OSM non prova da solo un errore: la mappa può essere incompleta o non aggiornata. L'esito serve a richiedere una verifica visiva del tracciato nella pagina dettaglio.",
+            "Le soglie sono configurabili con GPS_QUALITY_LONG_SEGMENT_M, GPS_QUALITY_TIME_COLLISION_DISTANCE_M, GPS_QUALITY_IMPLAUSIBLE_SPEED_KMH, GPS_QUALITY_ELAPSED_GAP_SEC, OSM_ROUTE_MATCH_RADIUS_M e OSM_ROUTE_MATCH_SAMPLE_LIMIT.",
         ],
     )
 
@@ -385,9 +485,10 @@ def add_admin(doc: Document):
         [
             "Upload multiplo di file .gpx e .json sidecar.",
             "Una coppia GPX + JSON con lo stesso nome base viene trattata come un solo bundle e genera un solo percorso arricchito.",
-            "Barra di avanzamento dedicata per il batch manuale.",
-            "Scarto per file troppo corti, tipo attività non ammesso, nome file già presente o contenuto ritenuto duplicato.",
-            "La deduplica dell'import manuale confronta il nuovo percorso contro tutta la cache già presente, non solo contro i percorsi manuali.",
+            "Barra di avanzamento dedicata per il batch manuale. I file selezionati vengono raggruppati in coppie GPX/JSON omonime e inviati in piccoli batch di cinque percorsi, per evitare saturazione della memoria del browser o del container web.",
+            "Prima del parsing, il nome del file GPX viene confrontato senza distinzione maiuscole/minuscole con i filename già salvati nel database: un nome uguale viene scartato immediatamente. File con nomi diversi vengono importati anche se la traccia presenta contenuto o estremi simili.",
+            "L'esito dell'import mostra quanti percorsi sono stati scartati per nome file, oltre agli scarti per file troppo corti o tipo attività non ammesso.",
+            "La deduplica dell'import manuale usa il filename GPX registrato nel database, indipendentemente dall'utente che aveva eseguito un caricamento precedente.",
             "I percorsi manuali vengono assegnati al contesto utente admin locale.",
         ],
     )
@@ -396,7 +497,9 @@ def add_admin(doc: Document):
         doc,
         [
             "Punteggi Street Skate: i pesi dell'algoritmo base non sono modificabili dalla dashboard admin e il punteggio resta fisso una volta salvato sul percorso.",
-            "Pulsanti autenticazione provider: pannello admin con checkbox per decidere se ciascun provider OAuth deve essere visibile nella home e se il relativo pulsante deve risultare cliccabile.",
+            "Utenze locali: form admin per creare account applicativi di ruolo admin o skater con username, nome, email e cellulare; il sistema genera una password temporanea di primo accesso, prova a inviarla via Resend e mantiene l'elenco utenti locali gia registrati.",
+            "Accettazione nuovi utenti: pannello admin con badge richieste In attesa di revisione, elenco richieste e link al dettaglio di ogni notifica di tipo Nuovo utente. Gli esiti sono In attesa di revisione, Eseguita: utenza creata o Rifiutata.",
+            "Pulsanti autenticazione provider: pannello admin con checkbox per decidere se ciascun provider OAuth deve essere visibile nella home e se il relativo pulsante deve risultare cliccabile. Il predefinito corrente mostra Strava abilitato e Suunto non cliccabile; gli altri provider sono nascosti e disabilitati.",
             "Controllo duplicati GPX: differenza distanza totale max, tolleranza estremi tracciato, controllo percorso invertito.",
             "Calcolo pendenze: finestra smoothing quota, lunghezza minima tratto, cap pendenza massima.",
             "Tipologia percorsi: tabella admin con ricerca testuale e salvataggio della tipologia per singolo percorso.",
@@ -415,7 +518,9 @@ def add_admin_settings_detail(doc: Document):
         shade_cell(c, "DCE6F2")
     rows = [
         ("Punteggi Street Skate", "Algoritmo base", "Il calcolo usa pesi fissi e non modificabili da interfaccia"),
-        ("Pulsanti provider", "visible, enabled per provider", "Controlla visibilità e click dei pulsanti OAuth nella pagina login"),
+        ("Utenze locali", "username, display_name, email, phone, role", "Permette di creare accessi locali admin o skater, inviare credenziali iniziali via Resend e imporre cambio password al primo accesso"),
+        ("Richieste utenti", "first_name, last_name, username, birth_date, email, phone, status", "Registra le richieste pubbliche, mostra il badge In attesa di revisione e permette approvazione o rifiuto. L'approvazione registra Eseguita: utenza creata"),
+        ("Pulsanti provider", "visible, enabled per provider", "Controlla visibilità e click dei pulsanti OAuth nella pagina login; il predefinito iniziale replica la configurazione corrente"),
         ("Controllo duplicati", "distance_diff_pct, endpoint_tolerance_m, allow_reverse_match", "Definiscono quando due tracciati sono considerati lo stesso percorso"),
         ("Calcolo pendenze", "smoothing_window, min_run_distance_m, max_cap_pct", "Influiscono sul profilo altimetrico e sui valori di pendenza"),
         ("Tipologia percorsi", "sport_type", "Permette all'admin di correggere il tipo attività del percorso salvato"),
@@ -441,21 +546,36 @@ def add_operational_notes(doc: Document):
             "In Docker il servizio web ascolta sulla porta 5000 e il database è pubblicato sulla porta host 5433.",
             "I container Docker di database e web app sono configurati sul fuso Europe/Rome per allineare log e timestamp operativi all'orario locale italiano.",
             "Per un deploy pubblico HTTPS, impostare APP_ENV=production e SESSION_COOKIE_SECURE=true, mantenendo localhost con SESSION_COOKIE_SECURE=false solo in sviluppo.",
-            "Le principali variabili sessione sono SESSION_COOKIE_BROWSER_CLOSE, SESSION_COOKIE_MAX_AGE_SEC e SESSION_INACTIVITY_TIMEOUT_SEC.",
+            "Le principali variabili sessione sono SESSION_COOKIE_BROWSER_CLOSE, SESSION_COOKIE_MAX_AGE_SEC e SESSION_INACTIVITY_TIMEOUT_SEC. Il timer lato browser usa SESSION_INACTIVITY_TIMEOUT_SEC.",
             "L'app supporta anche secret da file con convenzione VAR e VAR_FILE: se esiste un file montato in /run/secrets, il valore del file ha priorità rispetto a quello presente nel .env.",
             "Con Docker Compose locale è possibile mantenere i secret fuori dal repository creando file dedicati sotto docker/secrets e lasciando nel .env solo i riferimenti *_FILE.",
+        "Resend è operativo per l'invio di conferme registrazione, esiti di approvazione o negazione e credenziali temporanee. La configurazione usa RESEND_API_KEY o RESEND_API_KEY_FILE, RESEND_FROM_EMAIL e opzionalmente RESEND_REPLY_TO.",
+            "Le richieste pubbliche registrate nella tabella dedicata user_registration_requests vengono approvate o negate da admin. L'approvazione crea l'account nella tabella users e aggiorna nella stessa transazione lo stato richiesta a Eseguita: utenza creata. Anche l'admin bootstrap definito tramite file ambiente puo approvare le richieste, pur non avendo un record locale nella tabella users.",
+            "Nel deploy corrente il codice applicativo viene mantenuto in GitHub come sorgente del progetto, mentre il VPS conserva separatamente .env.production e i file in docker/secrets, esclusi dal versionamento.",
+            "Quando si aggiorna la produzione dopo modifiche locali, il flusso corretto e: sincronizzare il codice sul server, verificare che .env.production e docker/secrets contengano ancora client_id, client_secret e password necessari, quindi ricostruire i container.",
             "Per un deploy pubblico HTTPS, impostare anche SECURITY_ENABLE_HSTS=true dietro reverse proxy TLS stabile.",
             "Il reload automatico del server monitora solo il codice applicativo in app/, così modifiche a manuali o script di supporto non interrompono gli import in corso.",
+            "Per evitare carichi eccessivi nel browser, dashboard e API elenco inviano solo un riepilogo del percorso e un campione del profilo pendenza; tutti i punti GPS completi restano disponibili soltanto nella pagina di dettaglio del singolo percorso.",
             "La barra di import può essere numerica o animata, a seconda del tipo di import disponibile.",
             "I log di accesso, import, salvataggio impostazioni ed errori confluiscono nell'audit log.",
-            "L'utente standard vede solo i propri percorsi; l'admin vede tutto l'archivio.",
+            "Con la configurazione attuale i login provider vedono l'archivio globale in sola lettura; l'admin vede tutto l'archivio con pieni permessi di gestione.",
             "Le tabelle routes e auth_connections vengono aggiornate progressivamente in base a login e import.",
             "La dashboard web applica escaping dei contenuti dinamici renderizzati lato browser per ridurre il rischio di XSS sui campi importati dai provider o dai file caricati.",
             "Nota futura: la validazione avanzata della pavimentazione tramite video e AI è prevista come evoluzione più adatta alla futura mobile app, che potrà acquisire video, GPS e contesto del percorso direttamente dal dispositivo.",
         ],
     )
 
-    doc.add_heading("8.1 Condivisione temporanea della web app da PC locale", level=2)
+    doc.add_heading("8.1 Avvio locale con Docker Desktop", level=2)
+    add_bullets(
+        doc,
+        [
+            "Il file start-local.ps1, nella cartella principale del progetto, avvia Docker Desktop se non e gia disponibile, attende il daemon Docker e avvia docker compose up --build.",
+            "Da PowerShell eseguire: powershell -ExecutionPolicy Bypass -File .\\start-local.ps1.",
+            "Al termine dell'avvio, l'app e disponibile su http://localhost:5000. Per fermarla usare Ctrl+C nella finestra dello script.",
+        ],
+    )
+
+    doc.add_heading("8.2 Condivisione temporanea della web app da PC locale", level=2)
     add_bullets(
         doc,
         [
@@ -470,7 +590,7 @@ def add_operational_notes(doc: Document):
         ],
     )
 
-    doc.add_heading("8.2 Possibili implementazioni future", level=2)
+    doc.add_heading("8.3 Possibili implementazioni future", level=2)
     add_numbered(
         doc,
         [
@@ -498,8 +618,8 @@ def add_quick_reference(doc: Document):
         set_cell(c, t, bold=True)
         shade_cell(c, "DCE6F2")
     rows = [
-        ("Utente", "Login provider, import provider, filtrare, vedere dettagli, cancellare i propri percorsi", "Non accede alle impostazioni admin e non vede l'archivio completo"),
-        ("Admin", "Login locale, vedere tutti i percorsi, import manuale GPX/JSON, filtrare per utente, modificare parametri applicativi, leggere audit log, cancellare qualsiasi percorso", "Non usa il pulsante Importa da provider"),
+        ("Utente", "Login provider o account locale skater, vedere l'archivio globale, filtrare, vedere dettagli, punteggi fissi e cambiare password locale", "Archivio in sola lettura: non accede alle impostazioni admin e non puo importare o cancellare percorsi"),
+        ("Admin", "Login locale, vedere tutti i percorsi, import manuale GPX/JSON, filtrare per utente, modificare parametri applicativi, approvare richieste utenti, leggere audit log, cancellare qualsiasi percorso", "Non usa il pulsante Importa da provider"),
     ]
     for row in rows:
         cells = tbl.add_row().cells
@@ -547,6 +667,56 @@ def add_score_section(doc: Document):
     )
 
 
+def add_next_session_open_points(doc: Document):
+    doc.add_heading("11. Punti aperti per la prossima sessione", level=1)
+    doc.add_paragraph(
+        "Elenco operativo dei temi ancora aperti per la successiva sessione di progettazione e sviluppo."
+    )
+    add_numbered(
+        doc,
+        [
+            "Definire il testo definitivo delle email automatiche per conferma richiesta, approvazione e negazione utenza, inclusi mittente, oggetto e tono del messaggio.",
+            "Completare e testare end-to-end il flusso di registrazione pubblica, approvazione admin, invio credenziali, primo login e cambio password obbligatorio.",
+            "Adattare ulteriormente la UI in base al device corrente, con rifiniture dedicate a PC, smartphone e tablet.",
+            "Eseguire un caricamento locale completo dei percorsi adidas Running e verificare sistematicamente eventuali duplicati residui prima di nuovi import.",
+            "Importare il GPX del giro di ieri e validare gli avvisi di perdita segnale GPS e coerenza OSM, verificando in particolare eventuali segmenti rettilinei tra ultimo punto GPS e riaggancio. Regolare le soglie per evitare falsi positivi dovuti a pause automatiche, viabilità non mappata o export con punti radi.",
+            "Verificare se i percorsi storici già presenti nel profilo admin risultano coerenti e pienamente fruibili per tutte le utenze globali.",
+            "Implementare una rotta admin dedicata alla visualizzazione globale dei percorsi GPX presenti nel database, con mappa unica, caricamento di tutti i tracciati e possibilità di zoom in e zoom out.",
+            "Mantenere in sospeso le integrazioni provider non ancora operative o in review, in particolare adidas Running, Garmin, Suunto e Inline Route Tracking, fino alla disponibilità di API o credenziali definitive. La richiesta credenziali MapMyRun e stata inviata: alla ricezione configurare client ID e secret, callback pubblico e test OAuth/workout.",
+        ],
+    )
+
+
+def add_provider_sustainability(doc: Document):
+    doc.add_page_break()
+    doc.add_heading("12. Prospetto sostenibilità provider", level=1)
+    doc.add_paragraph(
+        "Il prospetto distingue la disponibilità tecnica dall'eventuale costo ricorrente. Nessun provider a pagamento deve essere attivato per utenti terzi senza conferma scritta della licenza multiutente e senza una copertura economica dedicata."
+    )
+    tbl = doc.add_table(rows=1, cols=4)
+    set_table_layout(tbl, [1.2, 1.55, 1.15, 2.7])
+    for c, t in zip(tbl.rows[0].cells, ["Provider", "Stato API/licenza", "Costo noto", "Decisione o prossimo passo"]):
+        set_cell(c, t, bold=True)
+        shade_cell(c, "DCE6F2")
+    rows = [
+        ("Strava", "OAuth attivo; limiti atleti da verificare", "n.d.", "Mantenere attivo solo entro i limiti concessi dall'app Strava."),
+        ("MapMyRun", "API promessa con MVP personale; uso multiutente e GPS da confermare", "USD 29,99/anno", "Sconto Ryan 25% già applicato nel link. Attendere conferma scritta prima dell'acquisto."),
+        ("Suunto", "Partner Program in review", "n.d.", "Attendere esito partnership, condizioni API e costi."),
+        ("Garmin", "Servizi API in migrazione", "n.d.", "Attendere ripresa servizi e condizioni Developer Program."),
+        ("adidas Running", "OAuth/API in standby; export locale disponibile", "n.d.", "Mantenere l'export locale come alternativa senza costo API."),
+        ("Inline Route Tracking", "In attesa API ufficiali", "n.d.", "Definire licenza, OAuth e schema dati con il team dell'app."),
+    ]
+    for row in rows:
+        cells = tbl.add_row().cells
+        for i, val in enumerate(row):
+            set_cell(cells[i], val)
+    p = doc.add_paragraph(style="ManualCallout")
+    p.add_run("Modello economico previsto: ").bold = True
+    p.add_run(
+        "funzioni base gratuite e quote Supporter facoltative per coprire VPS, dominio e provider approvati; non vendere accesso a provider finché le rispettive licenze non lo consentono espressamente."
+    )
+
+
 def add_footer(section):
     p = section.footer.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
@@ -560,7 +730,7 @@ def build():
     doc = Document()
     style_doc(doc)
     add_title(doc)
-    doc.add_paragraph()
+    add_contents(doc)
     add_overview(doc)
     add_login_modes(doc)
     add_screenshots(doc)
@@ -571,14 +741,15 @@ def build():
     add_operational_notes(doc)
     add_quick_reference(doc)
     add_score_section(doc)
+    add_next_session_open_points(doc)
+    add_provider_sustainability(doc)
+    enable_toc_update(doc)
     for section in doc.sections:
         add_footer(section)
-    try:
-        doc.save(OUT)
-        print(OUT)
-    except PermissionError:
-        doc.save(FALLBACK_OUT)
-        print(FALLBACK_OUT)
+    doc.save(OUT)
+    export_pdf()
+    print(OUT)
+    print(PDF_OUT)
 
 
 if __name__ == "__main__":

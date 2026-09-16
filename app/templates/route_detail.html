@@ -36,6 +36,8 @@
             <div><span>Verso pendenza max</span><strong>{{ route.difficulty.factors.max_slope_direction if route.difficulty and route.difficulty.factors else "n.d." }}</strong></div>
             <div><span>Velocità media</span><strong>{{ route.average_speed_kmh or 0 }} km/h</strong></div>
             <div><span>Sampietrini</span><strong>{{ "si" if route.enrichment and route.enrichment.has_cobblestone == true else "no" if route.enrichment and route.enrichment.has_cobblestone == false else "n.d." }}</strong></div>
+            <div><span>Integrità GPS</span><strong>{{ route.enrichment.track_quality.summary if route.enrichment and route.enrichment.track_quality else "n.d." }}</strong></div>
+            <div><span>Coerenza rete OSM</span><strong>{{ route.enrichment.track_alignment.summary if route.enrichment and route.enrichment.track_alignment else "n.d." }}</strong></div>
             <div><span>Difficoltà</span><strong>{{ route.difficulty.score if route.difficulty else 0 }}/100</strong></div>
             <div><span>Difficoltà dichiarata</span><strong>{{ route.difficulty.declared_difficulty.level ~ ' (' ~ route.difficulty.declared_difficulty.source ~ ')' if route.difficulty and route.difficulty.declared_difficulty else "n.d." }}</strong></div>
             <div><span>Importato il</span><strong>{{ route.imported_at[:10].split('-')|reverse|join('/') if route.imported_at else "n.d." }}</strong></div>
@@ -48,5 +50,6 @@
   <script id="routePayload" type="application/json">{{ route | tojson }}</script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script src="/static/js/route_detail.js?v={{ asset_version }}"></script>
+  <script src="/static/js/session-guard.js?v={{ asset_version }}" data-session-guard data-csrf="{{ csrf_token }}" data-timeout="{{ session_inactivity_timeout_sec }}"></script>
 </body>
 </html>

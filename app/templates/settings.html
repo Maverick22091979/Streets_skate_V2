@@ -17,6 +17,10 @@
           <p>Provider: <strong>{{ user.provider_label }}</strong></p>
         </div>
         <div class="header-actions">
+          {% if user.can_change_password %}
+          <a class="header-link" href="/account/password">Cambio password</a>
+          {% endif %}
+          <a class="header-link header-link-badge" href="/admin/registrations">Richieste utenti <span class="notif-badge">{{ pending_registration_count }}</span></a>
           <a class="header-link" href="/admin/route-types">Tipologia percorsi</a>
           <a class="header-link" href="/admin/logs">Log azioni</a>
           <a class="header-link" href="/admin/request-debug">Debug richiesta</a>
@@ -35,6 +39,140 @@
           </div>
         </div>
         <div class="gpx-upload-state">I pesi difficoltà non sono modificabili dalla dashboard admin.</div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Utenze locali</h2>
+            <p>Crea account applicativi di ruolo admin o skater (user) per l'accesso locale a Street Skate.</p>
+          </div>
+        </div>
+        {% if local_account_status %}
+        <div class="gpx-upload-state">{{ local_account_status }}</div>
+        {% endif %}
+        <form class="local-account-form" method="post" action="/admin/local-accounts">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label class="dup-card">
+            <span>Username</span>
+            <input type="text" name="username" minlength="3" required>
+          </label>
+          <label class="dup-card">
+            <span>Nome visualizzato</span>
+            <input type="text" name="display_name" placeholder="Nome e cognome o alias">
+          </label>
+          <label class="dup-card">
+            <span>Email</span>
+            <input type="email" name="email" required>
+          </label>
+          <label class="dup-card">
+            <span>Cellulare</span>
+            <input type="tel" name="phone" placeholder="+39..." required>
+          </label>
+          <label class="dup-card">
+            <span>Ruolo</span>
+            <select name="role" required>
+              <option value="skater">skater</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+          <div class="local-account-actions">
+            <button type="submit">Crea utenza</button>
+          </div>
+        </form>
+        <div class="route-type-table-wrap">
+          <table class="route-type-table">
+            <thead>
+              <tr>
+                <th>Nome</th>
+                <th>Cognome</th>
+                <th>Data nascita</th>
+                <th>Username</th>
+                <th>Nome visualizzato</th>
+                <th>Email</th>
+                <th>Cellulare</th>
+                <th>Ruolo</th>
+                <th>Stato</th>
+                <th>Primo accesso</th>
+                <th>Creata il</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if local_accounts %}
+                {% for account in local_accounts %}
+                <tr>
+                  <td>{{ account.first_name or 'n.d.' }}</td>
+                  <td>{{ account.last_name or 'n.d.' }}</td>
+                  <td>{{ account.birth_date or 'n.d.' }}</td>
+                  <td>{{ account.username }}</td>
+                  <td>{{ account.display_name }}</td>
+                  <td>{{ account.email }}</td>
+                  <td>{{ account.phone }}</td>
+                  <td>{{ account.role }}</td>
+                  <td>{{ 'attiva' if account.is_active else 'disattivata' }}</td>
+                  <td>{{ 'password da cambiare' if account.must_change_password else 'completato' }}</td>
+                  <td>{{ account.created_at }}</td>
+                </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="11">Nessuna utenza locale configurata.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="admin-panel">
+        <div class="admin-panel-head">
+          <div>
+            <h2>Accettazione nuovi utenti <span class="notif-badge">{{ pending_registration_count }}</span></h2>
+            <p>Richieste ricevute dalla pagina Registrati. Tutte le approvazioni generano account di ruolo skater/user.</p>
+          </div>
+          <a class="header-link" href="/admin/registrations">Apri coda completa</a>
+        </div>
+        {% if registration_status %}
+        <div class="gpx-upload-state">{{ registration_status }}</div>
+        {% endif %}
+        <div class="route-type-table-wrap">
+          <table class="route-type-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Ambito</th>
+                <th>Richiedente</th>
+                <th>Username</th>
+                <th>Email</th>
+                <th>Telefono</th>
+                <th>Stato</th>
+                <th>Richiesta il</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if registration_requests %}
+                {% for row in registration_requests %}
+                <tr>
+                  <td>{{ row.id }}</td>
+                  <td>Nuovo utente</td>
+                  <td>{{ row.display_name }}</td>
+                  <td>{{ row.username }}</td>
+                  <td>{{ row.email }}</td>
+                  <td>{{ row.phone }}</td>
+                  <td>{{ row.status_label }}</td>
+                  <td>{{ row.created_at }}</td>
+                  <td><a class="header-link" href="/admin/registrations/{{ row.id }}">Apri</a></td>
+                </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="9">Nessuna richiesta registrazione presente.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       {% if providers.adidas.export_available %}
@@ -164,5 +302,6 @@
   </main>
 
   <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
+  <script src="/static/js/session-guard.js?v={{ asset_version }}" data-session-guard data-csrf="{{ csrf_token }}" data-timeout="{{ session_inactivity_timeout_sec }}"></script>
 </body>
 </html>

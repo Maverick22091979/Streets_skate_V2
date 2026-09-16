@@ -12,5 +12,3 @@ __pycache__/
 data/export/
 com.runtastic.android-*.jadx
 *.apk
-
-artifacts/manuale_utente_street_skate_updated.docx

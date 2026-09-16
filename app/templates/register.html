@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Registrati - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="login-page">
+    <section class="login-card login-card-wide">
+      <div class="login-header">
+        <div class="brand">
+          <div class="brand-icon">GPS</div>
+          <div>
+            <h1>Richiesta registrazione</h1>
+            <p>Compila i dati richiesti. L'admin riceverà la notifica e potrà approvare o negare la richiesta.</p>
+          </div>
+        </div>
+      </div>
+
+      {% if error %}
+      <div class="alert">{{ error }}</div>
+      {% endif %}
+      {% if status %}
+      <div class="gpx-upload-state">{{ status }}</div>
+      {% endif %}
+
+      <form class="admin-form" method="post" action="/register">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+          Nome
+          <input type="text" name="first_name" autocomplete="given-name" required>
+        </label>
+        <label>
+          Cognome
+          <input type="text" name="last_name" autocomplete="family-name" required>
+        </label>
+        <label>
+          Username
+          <input type="text" name="username" minlength="3" autocomplete="username" required>
+        </label>
+        <label>
+          Data di nascita
+          <input type="date" name="birth_date" required>
+        </label>
+        <label>
+          Email
+          <input type="email" name="email" autocomplete="email" required>
+        </label>
+        <label>
+          Telefono
+          <input type="tel" name="phone" autocomplete="tel" required>
+        </label>
+        <button type="submit">Invia richiesta all'admin</button>
+      </form>
+
+      <div class="register-link-wrap">
+        <a class="register-link" href="/">Torna al login</a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -18,6 +18,10 @@
         </div>
         <div class="header-actions">
           <a class="header-link" href="/dashboard">Dashboard</a>
+          {% if user.can_change_password %}
+          <a class="header-link" href="/account/password">Cambio password</a>
+          {% endif %}
+          <a class="header-link header-link-badge" href="/admin/registrations">Richieste utenti <span class="notif-badge">{{ pending_registration_count }}</span></a>
           <a class="header-link" href="/admin/logs">Log azioni</a>
           <a class="header-link" href="/admin/request-debug">Debug richiesta</a>
           <form method="post" action="/logout">
@@ -106,5 +110,6 @@
       </section>
     </section>
   </main>
+  <script src="/static/js/session-guard.js?v={{ asset_version }}" data-session-guard data-csrf="{{ csrf_token }}" data-timeout="{{ session_inactivity_timeout_sec }}"></script>
 </body>
 </html>

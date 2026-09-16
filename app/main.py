@@ -1,22 +1,25 @@
 import asyncio
+import hashlib
 import math
 import secrets
 import json
 import time
 import uuid
 import ipaddress
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
+import httpx
+import stripe
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
@@ -24,13 +27,14 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.config import env_bool, env_float, env_int, env_value
 from app.db import Base, SessionLocal, engine, get_db
 from app.gpx_import import _declared_difficulty_from_filename, parse_gpx_bytes
-from app.models import AuditLog, AuthConnection, Route, User
+from app.models import AuditLog, AuthConnection, Route, User, UserRegistrationRequest
 from app.osm import fetch_surface_profile
 from app.providers import ProviderAdapter, build_provider_registry
 from app.slope import smooth_elevations, trend_metrics
+from app.track_quality import analyze_track_quality
 from app.weather import fetch_weather_snapshot
 
-APP_NAME = env_value("APP_NAME", "Street Skate Login")
+APP_NAME = env_value("APP_NAME", "Street Skate")
 APP_ENV = env_value("APP_ENV", "development").strip().lower()
 APP_SECRET_KEY = env_value("APP_SECRET_KEY", "") or secrets.token_urlsafe(48)
 ASSET_VERSION = env_value("ASSET_VERSION", datetime.now(UTC).strftime("%Y%m%d%H%M%S"))
@@ -50,6 +54,13 @@ OPEN_METEO_ARCHIVE_URL = env_value("OPEN_METEO_ARCHIVE_URL", "https://archive-ap
 OPEN_METEO_FORECAST_URL = env_value("OPEN_METEO_FORECAST_URL", "https://api.open-meteo.com/v1/forecast")
 IP_GEOLOOKUP_URL = env_value("IP_GEOLOOKUP_URL", "https://ipwho.is/{ip}")
 IP_GEOLOOKUP_TIMEOUT_SEC = env_float("IP_GEOLOOKUP_TIMEOUT_SEC", 3)
+RESEND_API_URL = env_value("RESEND_API_URL", "https://api.resend.com/emails")
+RESEND_API_KEY = env_value("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = env_value("RESEND_FROM_EMAIL", "")
+RESEND_FROM_NAME = env_value("RESEND_FROM_NAME", "Street Skate")
+RESEND_REPLY_TO = env_value("RESEND_REPLY_TO", "")
+STRIPE_SECRET_KEY = env_value("STRIPE_SECRET_KEY", "")
+STRIPE_SUPPORT_PRICE_ID = env_value("STRIPE_SUPPORT_PRICE_ID", "")
 ADIDAS_EXPORT_DIR = env_value("ADIDAS_EXPORT_DIR", "data/export/Sport-sessions/GPS-data")
 ADIDAS_EXPORT_USER_DIR = env_value("ADIDAS_EXPORT_USER_DIR", "data/export/User")
 MIN_IMPORT_DISTANCE_M = env_float("MIN_IMPORT_DISTANCE_M", 500)
@@ -57,6 +68,14 @@ SLOPE_SETTINGS = {
     "smoothing_window": env_int("SLOPE_SMOOTHING_WINDOW", 5),
     "min_run_distance_m": env_float("SLOPE_MIN_RUN_DISTANCE_M", 20),
     "max_cap_pct": env_float("SLOPE_MAX_CAP_PCT", 35),
+}
+TRACK_QUALITY_SETTINGS = {
+    "long_segment_m": env_float("GPS_QUALITY_LONG_SEGMENT_M", 250),
+    "time_collision_distance_m": env_float("GPS_QUALITY_TIME_COLLISION_DISTANCE_M", 50),
+    "implausible_speed_kmh": env_float("GPS_QUALITY_IMPLAUSIBLE_SPEED_KMH", 65),
+    "elapsed_gap_sec": env_float("GPS_QUALITY_ELAPSED_GAP_SEC", 120),
+    "osm_match_radius_m": env_int("OSM_ROUTE_MATCH_RADIUS_M", 35),
+    "osm_sample_limit": env_int("OSM_ROUTE_MATCH_SAMPLE_LIMIT", 24),
 }
 
 app = FastAPI(title=APP_NAME)
@@ -70,6 +89,7 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+templates.env.globals["session_inactivity_timeout_sec"] = SESSION_INACTIVITY_TIMEOUT_SEC
 
 PROVIDERS = build_provider_registry(BASE_URL)
 BASE_SKATE_WEIGHTS = {
@@ -89,16 +109,24 @@ DUPLICATE_SETTINGS = {
 VIEWER_SETTINGS = {
     "show_direction_arrows": env_bool("VIEWER_SHOW_DIRECTION_ARROWS", True),
 }
+LOCAL_ACCOUNT_ROLES = {"admin", "skater"}
 DEFAULT_PROVIDER_VISIBILITY = {
+    "strava": True,
     "adidas": False,
     "mapmyrun": False,
+    "suunto": True,
     "runkeeper": False,
     "garmin": False,
     "inline_route_tracking": False,
 }
 DEFAULT_PROVIDER_ENABLED = {
+    "strava": True,
     "adidas": False,
     "mapmyrun": False,
+    "suunto": False,
+    "runkeeper": False,
+    "garmin": False,
+    "inline_route_tracking": False,
 }
 PROVIDER_BUTTON_SETTINGS: dict[str, dict[str, bool]] = {
     key: {
@@ -169,6 +197,21 @@ SECURITY_HEADERS = {
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
     with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(32)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username_unique ON users (username) WHERE username IS NOT NULL"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email_unique ON users (email) WHERE email IS NOT NULL"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_phone_unique ON users (phone) WHERE phone IS NOT NULL"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_user_registration_requests_username_pending_unique ON user_registration_requests (username) WHERE status = 'pending'"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_user_registration_requests_email_pending_unique ON user_registration_requests (email) WHERE status = 'pending'"))
         conn.execute(text("ALTER TABLE routes ADD COLUMN IF NOT EXISTS import_user_label VARCHAR(255)"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_ip VARCHAR(64)"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_method VARCHAR(16)"))
@@ -289,6 +332,19 @@ def _get_local_admin(request: Request) -> dict[str, Any] | None:
     return local_admin if isinstance(local_admin, dict) else None
 
 
+def _must_change_password(request: Request) -> bool:
+    return bool(request.session.get("must_change_password"))
+
+
+def _current_local_user(request: Request, db: Session) -> User | None:
+    raw = request.session.get("local_user_id")
+    try:
+        user_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return db.get(User, user_id)
+
+
 def _is_same_origin_request(request: Request) -> bool:
     target = request.url
     for header_name in ("origin", "referer"):
@@ -317,6 +373,464 @@ def _require_csrf(request: Request, token: str | None = None) -> None:
         return
     if not expected or not provided or not secrets.compare_digest(str(provided), expected):
         raise HTTPException(status_code=403, detail="CSRF token non valido")
+
+
+def _hash_password(raw: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), bytes.fromhex(salt), 390000).hex()
+    return f"pbkdf2_sha256${salt}${digest}"
+
+
+def _verify_password(raw: str, encoded: str | None) -> bool:
+    value = (encoded or "").strip()
+    parts = value.split("$")
+    if len(parts) != 3 or parts[0] != "pbkdf2_sha256":
+        return False
+    _, salt, digest = parts
+    probe = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), bytes.fromhex(salt), 390000).hex()
+    return secrets.compare_digest(probe, digest)
+
+
+def _password_policy_error(password: str) -> str | None:
+    raw = password or ""
+    if len(raw) < 8:
+        return "La password deve avere almeno 8 caratteri"
+    if not any(ch.isupper() for ch in raw):
+        return "La password deve contenere almeno 1 lettera maiuscola"
+    if not any(ch.islower() for ch in raw):
+        return "La password deve contenere almeno 1 lettera minuscola"
+    if not any(ch.isdigit() for ch in raw):
+        return "La password deve contenere almeno 1 numero"
+    if not any(not ch.isalnum() for ch in raw):
+        return "La password deve contenere almeno 1 carattere speciale"
+    return None
+
+
+def _resend_configured() -> bool:
+    return bool(RESEND_API_KEY and RESEND_FROM_EMAIL)
+
+
+def _compose_display_name(first_name: str, last_name: str, fallback: str = "") -> str:
+    label = " ".join(part for part in [(first_name or "").strip(), (last_name or "").strip()] if part).strip()
+    return label or fallback.strip()
+
+
+def _normalize_email(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _normalize_phone(value: str) -> str:
+    return "".join(ch for ch in (value or "").strip() if ch.isdigit() or ch == "+")
+
+
+def _parse_birth_date(value: str) -> date | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("Data di nascita non valida") from exc
+
+
+def _generate_temporary_password(length: int = 14) -> str:
+    specials = "!@#$%&*?"
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    chars = [
+        secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ"),
+        secrets.choice("abcdefghijkmnopqrstuvwxyz"),
+        secrets.choice("23456789"),
+        secrets.choice(specials),
+    ]
+    while len(chars) < length:
+        chars.append(secrets.choice(alphabet + specials))
+    for i in range(len(chars) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        chars[i], chars[j] = chars[j], chars[i]
+    return "".join(chars)
+
+
+def _send_email(to: str, subject: str, text: str, html: str) -> None:
+    if not _resend_configured():
+        raise RuntimeError("Resend non configurato")
+    payload: dict[str, Any] = {
+        "from": f"{RESEND_FROM_NAME} <{RESEND_FROM_EMAIL}>" if RESEND_FROM_NAME else RESEND_FROM_EMAIL,
+        "to": [to],
+        "subject": subject,
+        "text": text,
+        "html": html,
+    }
+    if RESEND_REPLY_TO:
+        payload["reply_to"] = [RESEND_REPLY_TO]
+    with httpx.Client(timeout=20) as client:
+        response = client.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+    response.raise_for_status()
+
+
+def _send_temp_credentials_email(user: User, temp_password: str) -> None:
+    login_url = f"{BASE_URL.rstrip('/')}/"
+    subject = "Street Skate · Credenziali di primo accesso"
+    text = (
+        f"Ciao {user.display_name or user.username},\n\n"
+        "e stata creata la tua utenza Street Skate.\n\n"
+        f"Username: {user.username}\n"
+        f"Password temporanea: {temp_password}\n"
+        f"Ruolo: {user.role or 'skater'}\n\n"
+        f"Accedi da: {login_url}\n"
+        "Al primo accesso il sistema ti richiedera subito il cambio password.\n\n"
+        "Se non ti aspettavi questa email, contatta l'amministratore della piattaforma."
+    )
+    html = (
+        f"<p>Ciao <strong>{user.display_name or user.username}</strong>,</p>"
+        "<p>e stata creata la tua utenza Street Skate.</p>"
+        f"<p><strong>Username:</strong> {user.username}<br>"
+        f"<strong>Password temporanea:</strong> {temp_password}<br>"
+        f"<strong>Ruolo:</strong> {user.role or 'skater'}</p>"
+        f"<p><a href=\"{login_url}\">Accedi a Street Skate</a></p>"
+        "<p>Al primo accesso il sistema ti richiedera subito il cambio password.</p>"
+        "<p>Se non ti aspettavi questa email, contatta l'amministratore della piattaforma.</p>"
+    )
+    _send_email(user.email or "", subject, text, html)
+
+
+def _send_registration_received_email(req: UserRegistrationRequest) -> None:
+    subject = "Street Skate · Richiesta registrazione ricevuta"
+    text = (
+        f"Ciao {req.first_name},\n\n"
+        "la tua richiesta di registrazione a Street Skate e stata ricevuta.\n"
+        "Un admin la valutera e riceverai una risposta via email appena possibile.\n\n"
+        f"Username richiesto: {req.username}\n"
+        f"Email: {req.email}\n"
+        f"Telefono: {req.phone}\n"
+    )
+    html = (
+        f"<p>Ciao <strong>{req.first_name}</strong>,</p>"
+        "<p>la tua richiesta di registrazione a Street Skate e stata ricevuta.</p>"
+        "<p>Un admin la valutera e riceverai una risposta via email appena possibile.</p>"
+        f"<p><strong>Username richiesto:</strong> {req.username}<br>"
+        f"<strong>Email:</strong> {req.email}<br>"
+        f"<strong>Telefono:</strong> {req.phone}</p>"
+    )
+    _send_email(req.email, subject, text, html)
+
+
+def _send_registration_approved_email(user: User, temp_password: str) -> None:
+    login_url = f"{BASE_URL.rstrip('/')}/"
+    subject = "Street Skate · Registrazione approvata"
+    text = (
+        f"Ciao {user.display_name or user.username},\n\n"
+        "la tua richiesta di registrazione a Street Skate e stata approvata.\n\n"
+        f"Username: {user.username}\n"
+        f"Password temporanea: {temp_password}\n"
+        "Questa password e temporanea e dovra essere cambiata al primo accesso.\n\n"
+        f"Accedi da: {login_url}\n"
+    )
+    html = (
+        f"<p>Ciao <strong>{user.display_name or user.username}</strong>,</p>"
+        "<p>la tua richiesta di registrazione a Street Skate e stata approvata.</p>"
+        f"<p><strong>Username:</strong> {user.username}<br>"
+        f"<strong>Password temporanea:</strong> {temp_password}</p>"
+        "<p>Questa password e temporanea e dovra essere cambiata al primo accesso.</p>"
+        f"<p><a href=\"{login_url}\">Accedi a Street Skate</a></p>"
+    )
+    _send_email(user.email or "", subject, text, html)
+
+
+def _send_registration_denied_email(req: UserRegistrationRequest, notes: str = "") -> None:
+    subject = "Street Skate · Registrazione non approvata"
+    text = (
+        f"Ciao {req.first_name},\n\n"
+        "la tua richiesta di registrazione a Street Skate non e stata approvata.\n"
+    )
+    if notes:
+        text += f"\nMotivazione: {notes}\n"
+    text += "\nSe necessario puoi contattare l'amministrazione della piattaforma."
+    html = (
+        f"<p>Ciao <strong>{req.first_name}</strong>,</p>"
+        "<p>la tua richiesta di registrazione a Street Skate non e stata approvata.</p>"
+    )
+    if notes:
+        html += f"<p><strong>Motivazione:</strong> {notes}</p>"
+    html += "<p>Se necessario puoi contattare l'amministrazione della piattaforma.</p>"
+    _send_email(req.email, subject, text, html)
+
+
+def _find_local_account(db: Session, username: str) -> User | None:
+    normalized = (username or "").strip().lower()
+    if not normalized:
+        return None
+    return db.execute(select(User).where(User.username == normalized)).scalar_one_or_none()
+
+
+def _find_pending_registration(db: Session, request_id: int) -> UserRegistrationRequest | None:
+    return db.execute(
+        select(UserRegistrationRequest).where(UserRegistrationRequest.id == request_id)
+    ).scalar_one_or_none()
+
+
+def _get_or_create_local_connection(db: Session, account: User, commit: bool = True) -> AuthConnection:
+    provider_user_id = f"local:{account.username}"
+    stmt = select(AuthConnection).where(
+        AuthConnection.provider == "local",
+        AuthConnection.provider_user_id == provider_user_id,
+    )
+    conn = db.execute(stmt).scalar_one_or_none()
+    if conn:
+        return conn
+    conn = AuthConnection(
+        user_id=account.id,
+        provider="local",
+        provider_user_id=provider_user_id,
+        provider_username=account.username,
+        label=account.display_name or account.username or f"Utente {account.id}",
+        access_token="local",
+        refresh_token=None,
+        token_type="local",
+        scope=account.role or "skater",
+        raw_profile={
+            "source": "local_user",
+            "role": account.role,
+            "username": account.username,
+            "email": account.email,
+            "phone": account.phone,
+        },
+    )
+    db.add(conn)
+    db.flush()
+    if commit:
+        db.commit()
+        db.refresh(conn)
+    return conn
+
+
+def _list_local_accounts(db: Session) -> list[dict[str, Any]]:
+    rows = list(
+        db.execute(
+            select(User)
+            .where(User.username.is_not(None))
+            .order_by(User.role.asc().nullslast(), User.username.asc().nullslast(), User.id.asc())
+        ).scalars()
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "id": row.id,
+                "username": row.username or f"user-{row.id}",
+                "display_name": row.display_name or row.username,
+                "first_name": row.first_name or "",
+                "last_name": row.last_name or "",
+                "birth_date": row.birth_date.isoformat() if row.birth_date else "",
+                "role": row.role or "skater",
+                "email": row.email or "n.d.",
+                "phone": row.phone or "n.d.",
+                "is_active": row.is_active,
+                "must_change_password": row.must_change_password,
+                "created_at": row.created_at.astimezone().strftime("%d/%m/%Y %H:%M") if row.created_at else "n.d.",
+            }
+        )
+    return out
+
+
+def _create_local_account(
+    db: Session,
+    username: str,
+    display_name: str,
+    email: str,
+    phone: str,
+    role: str,
+    first_name: str = "",
+    last_name: str = "",
+    birth_date_value: str = "",
+    commit: bool = True,
+) -> tuple[User, str]:
+    normalized = (username or "").strip().lower()
+    clean_first_name = (first_name or "").strip()
+    clean_last_name = (last_name or "").strip()
+    clean_name = (display_name or "").strip() or _compose_display_name(clean_first_name, clean_last_name, normalized)
+    clean_email = _normalize_email(email)
+    clean_phone = _normalize_phone(phone)
+    clean_birth_date = _parse_birth_date(birth_date_value)
+    if role not in LOCAL_ACCOUNT_ROLES:
+        raise ValueError("Ruolo locale non valido")
+    if len(normalized) < 3:
+        raise ValueError("Username troppo corto")
+    if birth_date_value and not clean_birth_date:
+        raise ValueError("Data di nascita non valida")
+    if "@" not in clean_email or "." not in clean_email:
+        raise ValueError("Email non valida")
+    if len(clean_phone) < 8:
+        raise ValueError("Telefono non valido")
+    if _find_local_account(db, normalized):
+        raise ValueError("Username gia presente")
+    if db.execute(select(User).where(User.email == clean_email)).scalar_one_or_none():
+        raise ValueError("Email gia presente")
+    if db.execute(select(User).where(User.phone == clean_phone)).scalar_one_or_none():
+        raise ValueError("Telefono gia presente")
+    temp_password = _generate_temporary_password()
+    user = User(
+        display_name=clean_name or normalized,
+        first_name=clean_first_name or None,
+        last_name=clean_last_name or None,
+        birth_date=clean_birth_date,
+        username=normalized,
+        email=clean_email,
+        phone=clean_phone,
+        role=role,
+        password_hash=_hash_password(temp_password),
+        is_active=True,
+        must_change_password=True,
+    )
+    db.add(user)
+    db.flush()
+    if role == "skater":
+        _get_or_create_local_connection(db, user, commit=False)
+    if commit:
+        db.commit()
+        db.refresh(user)
+    return user, temp_password
+
+
+def _pending_registration_count(db: Session) -> int:
+    return int(
+        db.execute(
+            select(func.count(UserRegistrationRequest.id)).where(UserRegistrationRequest.status == "pending")
+        ).scalar_one()
+        or 0
+    )
+
+
+REGISTRATION_STATUS_LABELS = {
+    "pending": "In attesa di revisione",
+    "approved": "Eseguita: utenza creata",
+    "denied": "Rifiutata",
+}
+
+
+def _registration_status_label(status: str | None) -> str:
+    return REGISTRATION_STATUS_LABELS.get(str(status or ""), "Stato non valido")
+
+
+def _list_registration_requests(db: Session, status: str | None = None) -> list[dict[str, Any]]:
+    stmt = select(UserRegistrationRequest).order_by(
+        UserRegistrationRequest.created_at.desc(),
+        UserRegistrationRequest.id.desc(),
+    )
+    if status:
+        stmt = stmt.where(UserRegistrationRequest.status == status)
+    rows = list(db.execute(stmt).scalars())
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "id": row.id,
+                "request_type": row.request_type,
+                "first_name": row.first_name,
+                "last_name": row.last_name,
+                "display_name": _compose_display_name(row.first_name, row.last_name, row.username),
+                "username": row.username,
+                "birth_date": row.birth_date.isoformat() if row.birth_date else "",
+                "email": row.email,
+                "phone": row.phone,
+                "status": row.status,
+                "status_label": _registration_status_label(row.status),
+                "review_notes": row.review_notes or "",
+                "created_at": row.created_at.astimezone().strftime("%d/%m/%Y %H:%M") if row.created_at else "n.d.",
+                "reviewed_at": row.reviewed_at.astimezone().strftime("%d/%m/%Y %H:%M") if row.reviewed_at else "n.d.",
+                "created_user_id": row.created_user_id,
+            }
+        )
+    return out
+
+
+def _serialize_registration_request(row: UserRegistrationRequest) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "request_type": row.request_type,
+        "first_name": row.first_name,
+        "last_name": row.last_name,
+        "display_name": _compose_display_name(row.first_name, row.last_name, row.username),
+        "username": row.username,
+        "birth_date": row.birth_date.isoformat() if row.birth_date else "",
+        "email": row.email,
+        "phone": row.phone,
+        "status": row.status,
+        "status_label": _registration_status_label(row.status),
+        "review_notes": row.review_notes or "",
+        "created_at": row.created_at.astimezone().strftime("%d/%m/%Y %H:%M") if row.created_at else "n.d.",
+        "reviewed_at": row.reviewed_at.astimezone().strftime("%d/%m/%Y %H:%M") if row.reviewed_at else "n.d.",
+        "created_user_id": row.created_user_id,
+    }
+
+
+def _create_registration_request(
+    db: Session,
+    first_name: str,
+    last_name: str,
+    username: str,
+    birth_date_value: str,
+    email: str,
+    phone: str,
+) -> UserRegistrationRequest:
+    clean_first_name = (first_name or "").strip()
+    clean_last_name = (last_name or "").strip()
+    normalized = (username or "").strip().lower()
+    clean_email = _normalize_email(email)
+    clean_phone = _normalize_phone(phone)
+    clean_birth_date = _parse_birth_date(birth_date_value)
+    if len(clean_first_name) < 2:
+        raise ValueError("Nome troppo corto")
+    if len(clean_last_name) < 2:
+        raise ValueError("Cognome troppo corto")
+    if len(normalized) < 3:
+        raise ValueError("Username troppo corto")
+    if not clean_birth_date:
+        raise ValueError("Data di nascita obbligatoria")
+    if "@" not in clean_email or "." not in clean_email:
+        raise ValueError("Email non valida")
+    if len(clean_phone) < 8:
+        raise ValueError("Telefono non valido")
+    if _find_local_account(db, normalized):
+        raise ValueError("Username gia presente")
+    if db.execute(select(User).where(User.email == clean_email)).scalar_one_or_none():
+        raise ValueError("Email gia presente")
+    if db.execute(select(User).where(User.phone == clean_phone)).scalar_one_or_none():
+        raise ValueError("Telefono gia presente")
+    if db.execute(
+        select(UserRegistrationRequest).where(
+            UserRegistrationRequest.status == "pending",
+            UserRegistrationRequest.username == normalized,
+        )
+    ).scalar_one_or_none():
+        raise ValueError("Esiste gia una richiesta pendente per questo username")
+    if db.execute(
+        select(UserRegistrationRequest).where(
+            UserRegistrationRequest.status == "pending",
+            UserRegistrationRequest.email == clean_email,
+        )
+    ).scalar_one_or_none():
+        raise ValueError("Esiste gia una richiesta pendente per questa email")
+    req = UserRegistrationRequest(
+        request_type="new_user",
+        first_name=clean_first_name,
+        last_name=clean_last_name,
+        username=normalized,
+        birth_date=clean_birth_date,
+        email=clean_email,
+        phone=clean_phone,
+        status="pending",
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return req
 
 
 def _admin_login_key(request: Request, username: str) -> str:
@@ -372,6 +886,13 @@ def _actor_info(request: Request, db: Session) -> dict[str, str]:
             "label": f"Admin | {name} | {email}",
         }
     user, conn = _get_session_user(request, db)
+    if not user or not conn:
+        return {
+            "role": "Sessione anonima",
+            "name": "n.d.",
+            "email": "n.d.",
+            "label": "Sessione anonima | n.d.",
+        }
     profile = conn.raw_profile if conn and isinstance(conn.raw_profile, dict) else {}
     name = (
         user.display_name
@@ -707,6 +1228,22 @@ def _provider_import_profile(provider: str, token_type: str | None = None) -> di
                 "Nessuna classificazione iniziale da nome file perché l'import non parte da file locali.",
             ],
             "warning": "Se alcuni campi adidas non esistono in Strava, Street Skate importa solo il sottoinsieme compatibile e segnala implicitamente i mancanti come non disponibili.",
+        },
+        "local": {
+            "summary": "L'account locale skater accede all'archivio globale Street Skate in sola lettura senza integrare API esterne.",
+            "importable_fields": [
+                "Nessun import provider diretto",
+                "Consultazione percorsi e punteggi gia presenti",
+                "Filtri e dettaglio percorso disponibili",
+            ],
+            "differences": [
+                {"field": "Origine dati", "adidas": "Provider/export", "provider": "account applicativo locale"},
+            ],
+            "missing_fields": [
+                "Nessun download automatico da provider esterno.",
+                "Nessun token OAuth o sessione API associata.",
+            ],
+            "warning": "L'account skater locale e pensato per consultazione archivio, non per import o gestione amministrativa.",
         },
         "mapmyrun": {
             "summary": "MapMyRun usa una struttura differente basata su workout, aggregates e time_series.",
@@ -1084,6 +1621,8 @@ def _local_enrichment_placeholder() -> dict[str, Any]:
         "temperature_c": None,
         "segment_max_speed_kmh": None,
         "segment_speed_source": None,
+        "track_quality": None,
+        "track_alignment": None,
         "point_profile": {"points": [], "colors": [], "legend": []},
         "declared_difficulty": None,
     }
@@ -1173,9 +1712,31 @@ def _skate_difficulty(distance_m: float, elev_m: float, enrichment: dict[str, An
     }
 
 
-def _serialize_route(route: Route) -> dict[str, Any]:
+def _sample_values(values: list[Any], limit: int) -> list[Any]:
+    if len(values) <= limit:
+        return values
+    step = (len(values) - 1) / (limit - 1)
+    return [values[round(index * step)] for index in range(limit)]
+
+
+def _dashboard_enrichment(enrichment: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(enrichment)
+    profile = enrichment.get("point_profile")
+    if isinstance(profile, dict):
+        colors = profile.get("colors")
+        compact["point_profile"] = {
+            "colors": _sample_values(colors, 96) if isinstance(colors, list) else [],
+            "legend": profile.get("legend") if isinstance(profile.get("legend"), list) else [],
+        }
+    compact.pop("segment_speed_index", None)
+    compact.pop("surface_samples", None)
+    return compact
+
+
+def _serialize_route(route: Route, compact: bool = True) -> dict[str, Any]:
     enrichment = dict(route.enrichment or {}) if isinstance(route.enrichment, dict) else {}
     difficulty = dict(route.difficulty or {}) if isinstance(route.difficulty, dict) else {}
+    source_info = _route_storage_source(route)
     declared = difficulty.get("declared_difficulty")
     if not isinstance(declared, dict):
         declared = enrichment.get("declared_difficulty")
@@ -1197,10 +1758,14 @@ def _serialize_route(route: Route) -> dict[str, Any]:
     if isinstance(declared, dict):
         enrichment["declared_difficulty"] = declared
         difficulty["declared_difficulty"] = declared
+    if compact:
+        enrichment = _dashboard_enrichment(enrichment)
     return {
         "id": route.id,
         "external_id": route.external_id,
         "source": route.provider,
+        "source_label": source_info.get("detail") or route.provider,
+        "storage_label": source_info.get("label") or "n.d.",
         "import_user_id": route.user_id,
         "import_user_label": route.import_user_label or (route.user.display_name if route.user else None),
         "name": route.name,
@@ -1684,6 +2249,13 @@ def _normalize_for_storage(provider: str, raw: dict[str, Any]) -> dict[str, Any]
         enrichment["declared_difficulty"] = raw_payload.get("declared_difficulty")
     point_profile = _build_point_profile(coords, points, distance_m, elevation_gain_m)
     enrichment["point_profile"] = point_profile
+    enrichment["track_quality"] = analyze_track_quality(
+        point_profile["points"],
+        long_segment_m=TRACK_QUALITY_SETTINGS["long_segment_m"],
+        time_collision_distance_m=TRACK_QUALITY_SETTINGS["time_collision_distance_m"],
+        implausible_speed_kmh=TRACK_QUALITY_SETTINGS["implausible_speed_kmh"],
+        elapsed_gap_sec=TRACK_QUALITY_SETTINGS["elapsed_gap_sec"],
+    )
     enrichment["max_slope_pct"] = point_profile["max_slope_pct"]
     enrichment["max_slope_direction"] = point_profile.get("max_slope_direction")
     enrichment["weighted_avg_slope_pct"] = point_profile["weighted_avg_slope_pct"]
@@ -1720,16 +2292,26 @@ async def _enrich_route_data(db: Session, norm: dict[str, Any]) -> dict[str, Any
     enrichment = norm.get("enrichment") or _local_enrichment_placeholder()
     norm["enrichment"] = enrichment
     profile_points = (enrichment.get("point_profile") or {}).get("points") or []
-    if profile_points and not enrichment.get("dominant_surface"):
+    if profile_points and (not enrichment.get("dominant_surface") or not enrichment.get("track_alignment")):
         try:
-            osm = await fetch_surface_profile(OVERPASS_API_URL, profile_points)
+            osm = await fetch_surface_profile(
+                OVERPASS_API_URL,
+                profile_points,
+                validation_radius_m=TRACK_QUALITY_SETTINGS["osm_match_radius_m"],
+                validation_sample_limit=TRACK_QUALITY_SETTINGS["osm_sample_limit"],
+            )
             enrichment["dominant_surface"] = osm.get("dominant_surface")
             enrichment["dominant_smoothness"] = osm.get("dominant_smoothness")
             enrichment["has_cobblestone"] = bool(osm.get("has_cobblestone"))
             enrichment["surface_samples"] = osm.get("samples", [])
+            enrichment["track_alignment"] = osm.get("track_alignment")
             enrichment["surface_source"] = "overpass"
         except Exception:
             enrichment["surface_source"] = "overpass_unavailable"
+            enrichment["track_alignment"] = {
+                "status": "unavailable",
+                "summary": "Confronto rete OSM non disponibile",
+            }
     if profile_points and (enrichment.get("temperature_c") is None or enrichment.get("atmospheric_pressure_hpa") is None):
         try:
             weather = await fetch_weather_snapshot(
@@ -1766,12 +2348,8 @@ def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dic
     saved: list[Route] = []
     excluded_ext_ids = set(ext_ids)
     for item in items:
-        if item["external_id"] not in existing:
-            dup = (
-                _find_manual_duplicate_route(db, item, exclude_external_ids=excluded_ext_ids)
-                if conn.provider == "manual"
-                else _find_duplicate_route(db, item, provider=conn.provider, exclude_external_ids=excluded_ext_ids)
-            )
+        if item["external_id"] not in existing and conn.provider != "manual":
+            dup = _find_duplicate_route(db, item, provider=conn.provider, exclude_external_ids=excluded_ext_ids)
             if dup:
                 continue
         route = existing.get(item["external_id"])
@@ -1834,6 +2412,12 @@ def _current_provider_context(conn: AuthConnection | None) -> dict[str, Any]:
     if not conn:
         return {"provider_key": None, "provider_label": None}
     return {"provider_key": conn.provider, "provider_label": conn.label or conn.provider}
+
+
+def _strava_import_scope_granted(token_data: dict[str, Any]) -> bool:
+    raw = token_data.get("scope") or ""
+    granted = {item.strip() for item in str(raw).replace(" ", ",").split(",") if item.strip()}
+    return "activity:read_all" in granted
 
 
 def _is_admin(request: Request) -> bool:
@@ -1940,15 +2524,15 @@ def _find_manual_duplicate(db: Session, user: User, filename: str, candidate: di
     routes = list(db.execute(stmt).scalars())
     cand_points = _route_points_from_enrichment(candidate.get("enrichment"))
     cand_dist = float(candidate.get("distance_m") or 0)
-    cand_name = filename.lower().strip()
-    for route in routes:
-        if _is_same_route_candidate(route, candidate):
-            return "name", route
+    cand_name = Path(filename).name.casefold().strip()
     for route in routes:
         raw = route.raw_payload if isinstance(route.raw_payload, dict) else {}
-        existing_name = str(raw.get("filename") or "").lower().strip()
+        existing_name = Path(str(raw.get("filename") or "")).name.casefold().strip()
         if existing_name and existing_name == cand_name:
             return "filename", route
+    for route in routes:
+        if _is_same_route_candidate(route, candidate):
+            return "content", route
     for route in routes:
         existing_dist = float(route.distance_m or 0)
         if not cand_dist or not existing_dist:
@@ -1962,6 +2546,17 @@ def _find_manual_duplicate(db: Session, user: User, filename: str, candidate: di
     return None, None
 
 
+def _stored_route_filenames(db: Session) -> set[str]:
+    names: set[str] = set()
+    for raw in db.execute(select(Route.raw_payload)).scalars():
+        if not isinstance(raw, dict):
+            continue
+        filename = Path(str(raw.get("filename") or "")).name.casefold().strip()
+        if filename:
+            names.add(filename)
+    return names
+
+
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
     return templates.TemplateResponse(
@@ -1972,8 +2567,10 @@ def root(request: Request):
             "asset_version": ASSET_VERSION,
             "providers": _provider_meta(),
             "error": request.query_params.get("error"),
+            "status": request.query_params.get("status"),
             "fresh_login": request.query_params.get("fresh") == "1",
             "admin_username": ADMIN_USERNAME,
+            "now_label": datetime.now().astimezone().strftime("%d/%m/%Y %H:%M"),
             **_csrf_ctx(request),
         },
     )
@@ -1982,6 +2579,244 @@ def root(request: Request):
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     return root(request)
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_page(request: Request):
+    return templates.TemplateResponse(
+        "register.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "error": request.query_params.get("error"),
+            "status": request.query_params.get("status"),
+            **_csrf_ctx(request),
+        },
+    )
+
+
+@app.post("/register")
+def register_submit(
+    request: Request,
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    username: str = Form(...),
+    birth_date: str = Form(...),
+    email: str = Form(...),
+    phone: str = Form(...),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    try:
+        row = _create_registration_request(db, first_name, last_name, username, birth_date, email, phone)
+        mail_result = "not_sent"
+        mail_error = None
+        try:
+            _send_registration_received_email(row)
+            mail_result = "sent"
+        except Exception as exc:
+            mail_error = str(exc)
+        _write_audit_log_for_actor(
+            db,
+            "register_request_create",
+            "Anonimo",
+            _compose_display_name(row.first_name, row.last_name, row.username),
+            row.email,
+            meta={
+                "request_id": row.id,
+                "request_type": row.request_type,
+                "username": row.username,
+                "mail_result": mail_result,
+                "mail_error": mail_error,
+            },
+            request=request,
+        )
+        msg = "Richiesta inviata all'admin. Riceverai una risposta via email."
+        if mail_result != "sent":
+            msg += " Conferma automatica non inviata: richiesta comunque registrata."
+        return RedirectResponse(f"/?status={quote(msg)}", status_code=303)
+    except ValueError as exc:
+        return RedirectResponse(f"/register?error={quote(str(exc))}", status_code=303)
+
+
+@app.get("/change-password", response_class=HTMLResponse)
+def change_password_page(request: Request, db: Session = Depends(get_db)):
+    user = _current_local_user(request, db)
+    if not user or not _must_change_password(request):
+        return RedirectResponse("/dashboard", status_code=303)
+    return templates.TemplateResponse(
+        "change_password.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "username": user.username or "",
+            "error": request.query_params.get("error"),
+            **_csrf_ctx(request),
+        },
+    )
+
+
+@app.get("/account/password", response_class=HTMLResponse)
+def account_password_page(request: Request, db: Session = Depends(get_db)):
+    user = _current_local_user(request, db)
+    if not user:
+        return RedirectResponse("/dashboard", status_code=303)
+    return templates.TemplateResponse(
+        "account_password.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "username": user.username or "",
+            "error": request.query_params.get("error"),
+            "status": request.query_params.get("status"),
+            **_csrf_ctx(request),
+        },
+    )
+
+
+def _support_context(request: Request, db: Session) -> tuple[User, AuthConnection] | None:
+    if _is_admin(request):
+        return None
+    user, conn = _get_session_user(request, db)
+    return (user, conn) if user and conn else None
+
+
+@app.get("/support", response_class=HTMLResponse)
+def support_page(request: Request, db: Session = Depends(get_db)):
+    current = _support_context(request, db)
+    if not current:
+        return RedirectResponse("/dashboard", status_code=303)
+    user, conn = current
+    return templates.TemplateResponse(
+        "support.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "user": _current_provider_context(conn),
+            "configured": bool(STRIPE_SECRET_KEY and STRIPE_SUPPORT_PRICE_ID),
+            "status": request.query_params.get("status"),
+            "error": request.query_params.get("error"),
+            **_csrf_ctx(request),
+        },
+    )
+
+
+@app.post("/support/checkout")
+def support_checkout(request: Request, csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    _require_csrf(request, csrf_token)
+    current = _support_context(request, db)
+    if not current:
+        return RedirectResponse("/dashboard", status_code=303)
+    if not STRIPE_SECRET_KEY or not STRIPE_SUPPORT_PRICE_ID:
+        return RedirectResponse("/support?error=Supporto Stripe non configurato", status_code=303)
+    user, _ = current
+    try:
+        stripe.api_key = STRIPE_SECRET_KEY
+        checkout = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{"price": STRIPE_SUPPORT_PRICE_ID, "quantity": 1}],
+            success_url=f"{BASE_URL}/support/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{BASE_URL}/support?status=Pagamento annullato",
+            client_reference_id=str(user.id),
+            metadata={"street_skate_user_id": str(user.id), "purpose": "support"},
+        )
+        _write_audit_log(db, request, "support_checkout_start", meta={"checkout_session_id": checkout.id, "user_id": user.id})
+        return RedirectResponse(checkout.url, status_code=303)
+    except stripe.StripeError as exc:
+        _write_audit_log(db, request, "support_checkout_start", error=str(exc), meta={"user_id": user.id})
+        return RedirectResponse(f"/support?error={quote('Impossibile avviare il pagamento')}", status_code=303)
+
+
+@app.get("/support/success", response_class=HTMLResponse)
+def support_success(request: Request, session_id: str = "", db: Session = Depends(get_db)):
+    current = _support_context(request, db)
+    if not current:
+        return RedirectResponse("/dashboard", status_code=303)
+    paid = False
+    if STRIPE_SECRET_KEY and session_id:
+        try:
+            stripe.api_key = STRIPE_SECRET_KEY
+            checkout = stripe.checkout.Session.retrieve(session_id)
+            paid = checkout.payment_status == "paid"
+        except stripe.StripeError:
+            pass
+    return templates.TemplateResponse(
+        "support.html",
+        {"request": request, "app_name": APP_NAME, "asset_version": ASSET_VERSION, "user": _current_provider_context(current[1]), "configured": True, "paid": paid, "status": "Grazie per il supporto." if paid else "Pagamento non ancora confermato.", **_csrf_ctx(request)},
+    )
+
+
+@app.post("/change-password")
+def change_password_submit(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    user = _current_local_user(request, db)
+    if not user:
+        return RedirectResponse("/?error=Sessione non valida", status_code=303)
+    if not _verify_password(current_password, user.password_hash):
+        return RedirectResponse(f"/change-password?error={quote('Password attuale non valida')}", status_code=303)
+    if new_password != confirm_password:
+        return RedirectResponse(f"/change-password?error={quote('Le nuove password non coincidono')}", status_code=303)
+    policy_error = _password_policy_error(new_password)
+    if policy_error:
+        return RedirectResponse(f"/change-password?error={quote(policy_error)}", status_code=303)
+    user.password_hash = _hash_password(new_password)
+    user.must_change_password = False
+    db.add(user)
+    db.commit()
+    request.session["must_change_password"] = False
+    _write_audit_log(
+        db,
+        request,
+        "change_password",
+        meta={"user_id": user.id, "username": user.username},
+    )
+    return RedirectResponse("/dashboard", status_code=303)
+
+
+@app.post("/account/password")
+def account_password_submit(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    user = _current_local_user(request, db)
+    if not user:
+        return RedirectResponse("/?error=Sessione non valida", status_code=303)
+    if not _verify_password(current_password, user.password_hash):
+        return RedirectResponse(f"/account/password?error={quote('Password attuale non valida')}", status_code=303)
+    if new_password != confirm_password:
+        return RedirectResponse(f"/account/password?error={quote('Le nuove password non coincidono')}", status_code=303)
+    policy_error = _password_policy_error(new_password)
+    if policy_error:
+        return RedirectResponse(f"/account/password?error={quote(policy_error)}", status_code=303)
+    user.password_hash = _hash_password(new_password)
+    user.must_change_password = False
+    db.add(user)
+    db.commit()
+    request.session["must_change_password"] = False
+    _write_audit_log(
+        db,
+        request,
+        "change_password_voluntary",
+        meta={"user_id": user.id, "username": user.username},
+    )
+    return RedirectResponse(f"/account/password?status={quote('Password aggiornata')}", status_code=303)
 
 
 @app.post("/login/admin")
@@ -2002,16 +2837,60 @@ def login_admin(request: Request, username: str = Form(...), password: str = For
             request=request,
         )
         return RedirectResponse(f"/?error={quote(msg)}", status_code=303)
+    account = _find_local_account(db, username)
+    if account and account.is_active and _verify_password(password, account.password_hash):
+        _clear_admin_login_failures(request, username)
+        request.session.clear()
+        request.session["csrf_token"] = _ensure_csrf_token(request)
+        _start_authenticated_session(request)
+        request.session["must_change_password"] = bool(account.must_change_password)
+        request.session["local_user_id"] = account.id
+        if account.role == "admin":
+            request.session["local_admin"] = {
+                "provider": "admin",
+                "label": account.display_name or account.username,
+                "username": account.username,
+                "local_user_id": account.id,
+            }
+            _write_audit_log_for_actor(
+                db,
+                "login_admin",
+                "Admin",
+                account.display_name or "Admin locale",
+                account.username,
+                meta={"result": "success", "source": "local_account"},
+                request=request,
+            )
+            if account.must_change_password:
+                return RedirectResponse("/change-password", status_code=303)
+            return RedirectResponse("/dashboard", status_code=303)
+        conn = _get_or_create_local_connection(db, account)
+        request.session["user_id"] = account.id
+        request.session["connection_id"] = conn.id
+        request.session["import_consent"] = "read_only"
+        _write_audit_log_for_actor(
+            db,
+            "login_local_skater",
+            "Utente locale",
+            account.display_name or account.username,
+            account.username,
+            meta={"result": "success", "source": "local_account"},
+            request=request,
+        )
+        if account.must_change_password:
+            return RedirectResponse("/change-password", status_code=303)
+        return RedirectResponse("/dashboard", status_code=303)
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         _clear_admin_login_failures(request, username)
         request.session.clear()
+        request.session["csrf_token"] = _ensure_csrf_token(request)
         request.session["local_admin"] = {"provider": "admin", "label": "Admin locale", "username": username}
         _start_authenticated_session(request)
-        _write_audit_log_for_actor(db, "login_admin", "Admin", "Admin locale", username, meta={"result": "success"}, request=request)
+        _write_audit_log_for_actor(db, "login_admin", "Admin", "Admin locale", username, meta={"result": "success", "source": "env"}, request=request)
         return RedirectResponse("/dashboard", status_code=303)
     retry_after = _register_admin_login_failure(request, username)
     meta = {"result": "failed"}
-    error = "Credenziali admin non valide"
+    error = "Credenziali locali non valide"
     if retry_after:
         mins = max(1, math.ceil(retry_after / 60))
         error = f"Troppi tentativi admin falliti. Riprova tra circa {mins} minuto/i"
@@ -2102,6 +2981,7 @@ async def oauth_callback(
     db: Session = Depends(get_db),
 ):
     adapter = PROVIDERS.get(provider)
+    strava_import_allowed = False
     if not adapter:
         raise HTTPException(status_code=404, detail="Provider non supportato")
     if error:
@@ -2121,6 +3001,17 @@ async def oauth_callback(
             _write_audit_log_for_actor(db, f"oauth_callback_{provider}", "Anonimo", provider, None, error="Token mancante", request=request)
             return RedirectResponse(f"/?error=Token {adapter.cfg.label} mancante", status_code=303)
         profile = token_data.get("athlete") if provider == "strava" else await adapter.fetch_profile(token)
+        strava_import_allowed = provider == "strava" and _strava_import_scope_granted(token_data)
+        if provider == "strava" and not strava_import_allowed:
+            _write_audit_log_for_actor(
+                db,
+                "oauth_callback_strava",
+                "Anonimo",
+                "Strava",
+                None,
+                error="Permesso Strava attività private non concesso",
+                request=request,
+            )
         conn = _upsert_connection(db, adapter, provider, token_data, profile)
     except Exception as exc:
         _write_audit_log_for_actor(db, f"oauth_callback_{provider}", "Anonimo", provider, None, error=str(exc), request=request)
@@ -2128,7 +3019,8 @@ async def oauth_callback(
     request.session.clear()
     request.session["user_id"] = conn.user_id
     request.session["connection_id"] = conn.id
-    request.session["import_consent"] = "pending"
+    request.session["import_consent"] = "accepted" if strava_import_allowed else "read_only"
+    request.session["import_autostart"] = strava_import_allowed
     _start_authenticated_session(request)
     _write_audit_log(
         db,
@@ -2141,9 +3033,18 @@ async def oauth_callback(
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
     local_admin = _get_local_admin(request)
     if local_admin:
-        ctx = {"provider_key": "admin", "provider_label": local_admin["label"], "is_admin": True, "import_allowed": True, "read_only": False}
+        ctx = {
+            "provider_key": "admin",
+            "provider_label": local_admin["label"],
+            "is_admin": True,
+            "import_allowed": True,
+            "read_only": False,
+            "can_change_password": bool(_current_local_user(request, db)),
+        }
         routes = [_serialize_route(r) for r in _all_routes(db)]
         return templates.TemplateResponse(
             "dashboard.html",
@@ -2164,9 +3065,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     ctx = _current_provider_context(conn)
     ctx["is_admin"] = False
     ctx["read_only"] = True
-    ctx["import_consent"] = "read_only"
-    ctx["import_allowed"] = False
+    ctx["import_consent"] = request.session.get("import_consent", "read_only")
+    ctx["import_allowed"] = conn.provider == "strava" and ctx["import_consent"] == "accepted"
     ctx["import_autostart"] = bool(request.session.pop("import_autostart", False))
+    ctx["can_change_password"] = bool(_current_local_user(request, db))
+    ctx["support_available"] = bool(STRIPE_SECRET_KEY and STRIPE_SUPPORT_PRICE_ID)
     routes = [_serialize_route(r) for r in _all_routes(db)]
     return templates.TemplateResponse(
         "dashboard.html",
@@ -2186,23 +3089,263 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
     local_admin = _get_local_admin(request)
     if not local_admin:
         return RedirectResponse("/dashboard", status_code=303)
-    ctx = {"provider_key": "admin", "provider_label": local_admin["label"], "is_admin": True}
+    ctx = {
+        "provider_key": "admin",
+        "provider_label": local_admin["label"],
+        "is_admin": True,
+        "can_change_password": bool(_current_local_user(request, db)),
+    }
     providers = _provider_meta()
     return templates.TemplateResponse(
         "settings.html",
-        {"request": request, "app_name": APP_NAME, "asset_version": ASSET_VERSION, "user": ctx, "providers": providers, **_csrf_ctx(request)},
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "user": ctx,
+            "providers": providers,
+            "local_accounts": _list_local_accounts(db),
+            "local_account_status": request.query_params.get("local_account_status"),
+            "registration_requests": _list_registration_requests(db),
+            "pending_registration_count": _pending_registration_count(db),
+            "registration_status": request.query_params.get("registration_status"),
+            **_csrf_ctx(request),
+        },
     )
+
+
+@app.post("/admin/local-accounts")
+def admin_create_local_account(
+    request: Request,
+    username: str = Form(...),
+    display_name: str = Form(""),
+    email: str = Form(...),
+    phone: str = Form(...),
+    role: str = Form(...),
+    first_name: str = Form(""),
+    last_name: str = Form(""),
+    birth_date: str = Form(""),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    if _must_change_password(request):
+        return RedirectResponse(f"/change-password?error={quote('Cambio password richiesto prima di proseguire')}", status_code=303)
+    if not _is_admin(request):
+        return RedirectResponse(f"/settings?local_account_status={quote('Accesso admin richiesto')}", status_code=303)
+    try:
+        account, temp_password = _create_local_account(
+            db,
+            username,
+            display_name,
+            email,
+            phone,
+            role,
+            first_name=first_name,
+            last_name=last_name,
+            birth_date_value=birth_date,
+        )
+        mail_result = "not_sent"
+        mail_error = None
+        try:
+            _send_temp_credentials_email(account, temp_password)
+            mail_result = "sent"
+        except Exception as exc:
+            mail_error = str(exc)
+        _write_audit_log(
+            db,
+            request,
+            "create_local_account",
+            meta={
+                "username": account.username,
+                "display_name": account.display_name,
+                "first_name": account.first_name,
+                "last_name": account.last_name,
+                "birth_date": account.birth_date.isoformat() if account.birth_date else None,
+                "email": account.email,
+                "phone": account.phone,
+                "role": account.role,
+                "mail_result": mail_result,
+                "mail_error": mail_error,
+            },
+        )
+        if mail_result == "sent":
+            msg = f"Utenza {account.role} creata: {account.username} | email inviata a {account.email}"
+        else:
+            msg = (
+                f"Utenza {account.role} creata: {account.username} | invio email fallito ({mail_error or 'errore sconosciuto'}) "
+                f"| password primo accesso: {temp_password}"
+            )
+    except ValueError as exc:
+        msg = str(exc)
+    return RedirectResponse(f"/settings?local_account_status={quote(msg)}", status_code=303)
+
+
+@app.get("/admin/registrations", response_class=HTMLResponse)
+def admin_registrations(request: Request, state: str | None = None, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
+    local_admin = _get_local_admin(request)
+    if not local_admin:
+        return RedirectResponse("/dashboard", status_code=303)
+    rows = _list_registration_requests(db, state if state in {"pending", "approved", "denied"} else None)
+    return templates.TemplateResponse(
+        "admin_registrations.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "user": {
+                "provider_key": "admin",
+                "provider_label": local_admin["label"],
+                "is_admin": True,
+                "can_change_password": bool(_current_local_user(request, db)),
+            },
+            "rows": rows,
+            "status_filter": state or "",
+            "pending_registration_count": _pending_registration_count(db),
+            "status": request.query_params.get("message"),
+            **_csrf_ctx(request),
+        },
+    )
+
+
+@app.get("/admin/registrations/{request_id}", response_class=HTMLResponse)
+def admin_registration_detail(request_id: int, request: Request, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
+    local_admin = _get_local_admin(request)
+    if not local_admin:
+        return RedirectResponse("/dashboard", status_code=303)
+    row = _find_pending_registration(db, request_id)
+    if not row:
+        return RedirectResponse(f"/admin/registrations?message={quote('Richiesta non trovata')}", status_code=303)
+    return templates.TemplateResponse(
+        "admin_registration_detail.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            "user": {
+                "provider_key": "admin",
+                "provider_label": local_admin["label"],
+                "is_admin": True,
+                "can_change_password": bool(_current_local_user(request, db)),
+            },
+            "registration": _serialize_registration_request(row),
+            "pending_registration_count": _pending_registration_count(db),
+            "status": request.query_params.get("status"),
+            **_csrf_ctx(request),
+        },
+    )
+
+
+@app.post("/admin/registrations/{request_id}/review")
+def admin_registration_review(
+    request_id: int,
+    request: Request,
+    action: str = Form(...),
+    review_notes: str = Form(""),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    if _must_change_password(request):
+        return RedirectResponse(f"/change-password?error={quote('Cambio password richiesto prima di proseguire')}", status_code=303)
+    reviewer = _current_local_user(request, db)
+    if not _is_admin(request):
+        return RedirectResponse("/dashboard", status_code=303)
+    row = _find_pending_registration(db, request_id)
+    if not row:
+        return RedirectResponse(f"/admin/registrations?message={quote('Richiesta non trovata')}", status_code=303)
+    if row.status != "pending":
+        return RedirectResponse(f"/admin/registrations/{request_id}?status={quote('Richiesta gia lavorata')}", status_code=303)
+    if action not in {"approve", "deny"}:
+        return RedirectResponse(f"/admin/registrations/{request_id}?status={quote('Azione non valida')}", status_code=303)
+    clean_notes = (review_notes or "").strip()
+    mail_result = "not_sent"
+    mail_error = None
+    created_user = None
+    temp_password = None
+    try:
+        if action == "approve":
+            created_user, temp_password = _create_local_account(
+                db,
+                row.username,
+                _compose_display_name(row.first_name, row.last_name, row.username),
+                row.email,
+                row.phone,
+                "skater",
+                first_name=row.first_name,
+                last_name=row.last_name,
+                birth_date_value=row.birth_date.isoformat() if row.birth_date else "",
+                commit=False,
+            )
+            row.status = "approved"
+            row.created_user_id = created_user.id
+        else:
+            row.status = "denied"
+        row.review_notes = clean_notes or None
+        row.reviewed_by_user_id = reviewer.id if reviewer else None
+        row.reviewed_at = datetime.now(UTC)
+        db.add(row)
+        db.commit()
+        try:
+            if action == "approve":
+                _send_registration_approved_email(created_user, temp_password)
+            else:
+                _send_registration_denied_email(row, clean_notes)
+            mail_result = "sent"
+        except Exception as exc:
+            mail_error = str(exc)
+        _write_audit_log(
+            db,
+            request,
+            "registration_request_review",
+            meta={
+                "request_id": row.id,
+                "action": action,
+                "username": row.username,
+                "mail_result": mail_result,
+                "mail_error": mail_error,
+                "created_user_id": created_user.id if created_user else None,
+            },
+        )
+        if action == "approve" and mail_result != "sent":
+            msg = f"Richiesta eseguita: utenza creata, mail non inviata ({mail_error or 'errore sconosciuto'}). Password temporanea: {temp_password}"
+        elif action == "approve":
+            msg = "Richiesta eseguita: utenza creata ed email inviata"
+        elif mail_result != "sent":
+            msg = f"Richiesta negata, mail non inviata ({mail_error or 'errore sconosciuto'})"
+        else:
+            msg = "Richiesta negata ed email inviata"
+        return RedirectResponse(f"/admin/registrations/{request_id}?status={quote(msg)}", status_code=303)
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/admin/registrations/{request_id}?status={quote(str(exc))}", status_code=303)
+    except Exception as exc:
+        db.rollback()
+        return RedirectResponse(f"/admin/registrations/{request_id}?status={quote(f'Errore elaborazione richiesta: {exc}')}", status_code=303)
 
 
 @app.get("/admin/route-types", response_class=HTMLResponse)
 def admin_route_types(request: Request, q: str | None = None, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
     local_admin = _get_local_admin(request)
     if not local_admin:
         return RedirectResponse("/dashboard", status_code=303)
-    ctx = {"provider_key": "admin", "provider_label": local_admin["label"], "is_admin": True}
+    ctx = {
+        "provider_key": "admin",
+        "provider_label": local_admin["label"],
+        "is_admin": True,
+        "can_change_password": bool(_current_local_user(request, db)),
+    }
     query = (q or "").strip().lower()
     routes = list(db.execute(select(Route).order_by(Route.start_date_local.desc().nullslast(), Route.id.desc())).scalars())
     if query:
@@ -2232,6 +3375,7 @@ def admin_route_types(request: Request, q: str | None = None, db: Session = Depe
             "app_name": APP_NAME,
             "asset_version": ASSET_VERSION,
             "user": ctx,
+            "pending_registration_count": _pending_registration_count(db),
             "rows": rows,
             "q": q or "",
             "status": request.query_params.get("status"),
@@ -2242,10 +3386,17 @@ def admin_route_types(request: Request, q: str | None = None, db: Session = Depe
 
 @app.get("/admin/logs", response_class=HTMLResponse)
 def admin_logs(request: Request, q: str | None = None, limit: int = 500, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
     local_admin = _get_local_admin(request)
     if not local_admin:
         return RedirectResponse("/dashboard", status_code=303)
-    ctx = {"provider_key": "admin", "provider_label": local_admin["label"], "is_admin": True}
+    ctx = {
+        "provider_key": "admin",
+        "provider_label": local_admin["label"],
+        "is_admin": True,
+        "can_change_password": bool(_current_local_user(request, db)),
+    }
     size = min(max(int(limit or 200), 20), 2000)
     query = (q or "").strip().lower()
     logs = list(db.execute(select(AuditLog).order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc()).limit(size)).scalars())
@@ -2290,6 +3441,7 @@ def admin_logs(request: Request, q: str | None = None, limit: int = 500, db: Ses
             "app_name": APP_NAME,
             "asset_version": ASSET_VERSION,
             "user": ctx,
+            "pending_registration_count": _pending_registration_count(db),
             "rows": rows,
             "q": q or "",
             "limit": size,
@@ -2299,11 +3451,18 @@ def admin_logs(request: Request, q: str | None = None, limit: int = 500, db: Ses
 
 
 @app.get("/admin/request-debug", response_class=HTMLResponse)
-def admin_request_debug(request: Request):
+def admin_request_debug(request: Request, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
     local_admin = _get_local_admin(request)
     if not local_admin:
         return RedirectResponse("/dashboard", status_code=303)
-    ctx = {"provider_key": "admin", "provider_label": local_admin["label"], "is_admin": True}
+    ctx = {
+        "provider_key": "admin",
+        "provider_label": local_admin["label"],
+        "is_admin": True,
+        "can_change_password": bool(_current_local_user(request, db)),
+    }
     payload = _request_debug_payload(request)
     return templates.TemplateResponse(
         "admin_request_debug.html",
@@ -2312,6 +3471,7 @@ def admin_request_debug(request: Request):
             "app_name": APP_NAME,
             "asset_version": ASSET_VERSION,
             "user": ctx,
+            "pending_registration_count": _pending_registration_count(db),
             "payload": payload,
             **_csrf_ctx(request),
         },
@@ -2365,7 +3525,7 @@ def route_detail(route_id: int, request: Request, db: Session = Depends(get_db))
             "app_name": APP_NAME,
             "asset_version": ASSET_VERSION,
             "user": user_ctx,
-            "route": _serialize_route(route),
+            "route": _serialize_route(route, compact=False),
             "viewer_settings": VIEWER_SETTINGS,
             **_csrf_ctx(request),
         },
@@ -2416,9 +3576,10 @@ async def api_import_provider(
     user, conn = _get_session_user(request, db)
     if not user or not conn:
         raise HTTPException(status_code=401, detail="Sessione non autenticata")
-    raise HTTPException(status_code=403, detail="Archivio globale in sola lettura per i login provider")
     if conn.provider != provider:
         raise HTTPException(status_code=400, detail="Il provider della sessione non coincide con quello richiesto")
+    if provider != "strava" or request.session.get("import_consent") != "accepted":
+        raise HTTPException(status_code=403, detail="Import non autorizzato per questa sessione provider")
     adapter = PROVIDERS.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Provider non supportato")
@@ -2486,9 +3647,10 @@ async def api_import_provider_start(request: Request, provider: str, db: Session
     user, conn = _get_session_user(request, db)
     if not user or not conn:
         raise HTTPException(status_code=401, detail="Sessione non autenticata")
-    raise HTTPException(status_code=403, detail="Archivio globale in sola lettura per i login provider")
     if conn.provider != provider:
         raise HTTPException(status_code=400, detail="Il provider della sessione non coincide con quello richiesto")
+    if provider != "strava" or request.session.get("import_consent") != "accepted":
+        raise HTTPException(status_code=403, detail="Import non autorizzato per questa sessione provider")
     total = len(_adidas_export_bundles()) if provider == "adidas" and conn.token_type == "export" else 0
     job_id = uuid.uuid4().hex
     IMPORT_JOBS[job_id] = {
@@ -2527,11 +3689,11 @@ async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: l
     user, conn = _get_or_create_admin_entities(db)
     imported_items: list[dict[str, Any]] = []
     skipped_filename = 0
-    skipped_content = 0
     skipped_short = 0
     skipped_wrong_type = 0
     skipped_short_names: list[str] = []
     skipped_wrong_type_names: list[str] = []
+    stored_filenames = _stored_route_filenames(db)
     bundles: dict[str, dict[str, tuple[str, bytes]]] = {}
     for f in files:
         if not f.filename:
@@ -2548,6 +3710,10 @@ async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: l
             continue
         processed_bundles += 1
         gpx_name, gpx_raw = bundle[".gpx"]
+        filename_key = Path(gpx_name).name.casefold().strip()
+        if filename_key in stored_filenames:
+            skipped_filename += 1
+            continue
         sidecar_raw = bundle.get(".json", (None, None))[1]
         parsed = parse_gpx_bytes(gpx_raw, gpx_name, sidecar_raw=sidecar_raw)
         sport_type = str(parsed.get("sport_type") or "").strip()
@@ -2560,17 +3726,12 @@ async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: l
             skipped_short_names.append(parsed.get("name") or gpx_name)
             continue
         norm = _normalize_for_storage("manual", parsed)
-        dup_kind, _ = _find_manual_duplicate(db, user, gpx_name, norm)
-        if dup_kind == "filename":
-            skipped_filename += 1
-            continue
-        if dup_kind == "content":
-            skipped_content += 1
-            continue
         norm = await _enrich_route_data(db, norm)
         norm["external_id"] = f'gpx:{gpx_name}:{int(datetime.now(UTC).timestamp())}:{len(imported_items)}'
         imported_items.append(norm)
+        stored_filenames.add(filename_key)
     routes = _store_routes(db, user, conn, imported_items)
+    request.session["session_last_seen_at"] = time.time()
     _write_audit_log(
         db,
         request,
@@ -2580,7 +3741,6 @@ async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: l
             "processed_bundles": processed_bundles,
             "imported": len(imported_items),
             "skipped_filename": skipped_filename,
-            "skipped_content": skipped_content,
             "skipped_short": skipped_short,
             "skipped_wrong_type": skipped_wrong_type,
             "skipped_wrong_type_names": skipped_wrong_type_names[:10],
@@ -2593,7 +3753,6 @@ async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: l
             "files_received": len(files),
             "processed_bundles": processed_bundles,
             "skipped_filename": skipped_filename,
-            "skipped_content": skipped_content,
             "skipped_short": skipped_short,
             "skipped_short_names": skipped_short_names,
             "skipped_wrong_type": skipped_wrong_type,
@@ -2624,7 +3783,7 @@ async def dashboard_import_gpx(request: Request, csrf_token: str = Form(...), fi
             wrong_type_msg += f" ({', '.join(wrong_type_names[:3])})"
         msg = (
             f'Import completato: {body.get("imported", 0)} percorsi da {body.get("processed_bundles", 0)} bundle GPX/JSON, '
-            f'scartati nome={body.get("skipped_filename", 0)}, contenuto={body.get("skipped_content", 0)}{short_msg}{wrong_type_msg}, '
+            f'scartati nome file={body.get("skipped_filename", 0)}{short_msg}{wrong_type_msg}, '
             f'totale cache {body.get("total_cached", 0)}'
         )
         return RedirectResponse(f"/dashboard?gpx_status={quote(msg)}", status_code=303)
@@ -2649,6 +3808,25 @@ async def logout(request: Request, csrf_token: str = Form(...), db: Session = De
     _write_audit_log(db, request, "logout", error=revoke_error if revoke_error else None)
     request.session.clear()
     return RedirectResponse("/?fresh=1", status_code=303)
+
+
+@app.post("/session/close-tab")
+def close_tab_session(
+    request: Request,
+    csrf_token: str = Form(...),
+    reason: str = Form("tab_closed"),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    action = "session_timeout" if reason == "timeout" else "session_tab_closed"
+    _write_audit_log(
+        db,
+        request,
+        action,
+        meta={"reason": reason, "timeout_sec": SESSION_INACTIVITY_TIMEOUT_SEC},
+    )
+    request.session.clear()
+    return Response(status_code=204)
 
 
 @app.get("/api/status")

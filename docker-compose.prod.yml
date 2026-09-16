@@ -35,6 +35,7 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       APP_SECRET_KEY_FILE: /run/secrets/app_secret_key
       ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      STRIPE_SECRET_KEY_FILE: /run/secrets/stripe_secret_key
       STRAVA_CLIENT_SECRET_FILE: /run/secrets/strava_client_secret
       MAPMYRUN_CLIENT_SECRET_FILE: /run/secrets/mapmyrun_client_secret
       SUUNTO_CLIENT_SECRET_FILE: /run/secrets/suunto_client_secret

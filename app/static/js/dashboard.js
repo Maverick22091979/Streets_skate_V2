@@ -268,6 +268,7 @@ function renderRoutes(routes) {
   renderGlobalStats(filtered);
   updateRoutesProgress(filtered.length, allRoutes.length);
   grid.innerHTML = filtered.map(renderRoute).join('');
+  bindRouteCards();
   bindDeleteButtons();
   return filtered;
 }
@@ -399,9 +400,9 @@ function wrongTypeSkipMessage(count, names) {
 function renderRoute(route) {
   const d = route.difficulty || {};
   const f = d.factors || {};
-  const b = d.breakdown || {};
   const dd = d.declared_difficulty || null;
-  const prof = route.enrichment?.point_profile || {};
+  const trackQuality = route.enrichment?.track_quality || {};
+  const trackAlignment = route.enrichment?.track_alignment || {};
   const routeId = safeNum(route.id, 0);
   const score = safeNum(d.score, 0);
   const scoreLabel = escapeHtml(d.label || '');
@@ -412,18 +413,9 @@ function renderRoute(route) {
   const declaredSource = escapeHtml(dd?.source || 'n.d.');
   const declaredTitle = dd ? `Difficoltà dichiarata: ${declaredLevel}` : 'Difficoltà dichiarata: n.d.';
   const declaredClass = declaredDifficultyClasses[dd?.level] || declaredDifficultyClasses.Unknown;
-  const strip = (prof.colors || []).map((c) => {
-    const klass = slopeColorClasses[safeColor(c, '#cbd5e1')] || slopeColorClasses['#cbd5e1'];
-    return `<span class="${klass}"></span>`;
-  }).join('');
-  const legend = (prof.legend || []).map(item => `
-    <div class="slope-legend-item">
-      <i class="${slopeColorClasses[safeColor(item.color, '#cbd5e1')] || slopeColorClasses['#cbd5e1']}"></i>
-      <span>${escapeHtml(item.label || '')}</span>
-    </div>
-  `).join('');
+  const href = `/routes/${routeId}`;
   return `
-    <article class="route-card">
+    <article class="route-card route-card-compact" data-route-href="${href}" tabindex="0" role="link" aria-label="Apri dettagli di ${safeAttr(route.name || 'percorso')}">
       <div class="route-top">
         <div class="score ${badgeClass(score)}">
           <strong>${score}</strong>
@@ -432,44 +424,25 @@ function renderRoute(route) {
         <div>
           <h2 class="route-title">
             <span class="route-declared-dot ${declaredClass}" title="${safeAttr(declaredTitle)}"></span>
-            <a class="route-link" href="/routes/${routeId}">${title}</a>
+            <span class="route-link">${title}</span>
           </h2>
           <p>${type} · ${startDate}</p>
         </div>
         ${isAdmin ? `<div class="route-actions"><button class="route-delete" type="button" data-route-id="${routeId}">Cancella</button></div>` : ''}
       </div>
 
-      <div class="route-rows">
-        <div class="route-row"><span>Distanza</span><strong>${safeText(route.distance_km, ' km')}</strong></div>
-        <div class="route-row"><span>Utente importatore</span><strong>${safeText(route.import_user_label)}</strong></div>
-        <div class="route-row"><span>Difficoltà dichiarata</span><strong>${dd ? `${declaredLevel} (${declaredSource})` : 'n.d.'}</strong></div>
-        <div class="route-row"><span>Dislivello</span><strong>${safeText(route.elevation_gain_m, ' m')}</strong></div>
-        <div class="route-row"><span>Pendenza media</span><strong>${safeText(route.avg_grade_pct, '%')}</strong></div>
-        <div class="route-row"><span>Velocità media</span><strong>${safeText(route.average_speed_kmh, ' km/h')}</strong></div>
-        <div class="route-row"><span>Pendenza max assoluta</span><strong>${safeText(f.max_slope_pct, '%')}</strong></div>
-        <div class="route-row"><span>Verso pendenza max</span><strong>${safeText(f.max_slope_direction)}</strong></div>
-        <div class="route-row"><span>Pendenza media ponderata assoluta</span><strong>${safeText(f.weighted_avg_slope_pct, '%')}</strong></div>
-        <div class="route-row"><span>Velocità max tratto</span><strong>${safeText(f.segment_max_speed_kmh, ' km/h')}</strong></div>
-        <div class="route-row"><span>Pavimentazione</span><strong>${safeText(f.surface_type)}</strong></div>
-        <div class="route-row"><span>Sampietrini</span><strong>${f.has_cobblestone === true ? 'si' : f.has_cobblestone === false ? 'no' : 'n.d.'}</strong></div>
-        <div class="route-row"><span>Smoothness</span><strong>${safeText(f.smoothness_type)}</strong></div>
-        <div class="route-row"><span>Pressione atmosferica</span><strong>${safeText(f.atmospheric_pressure_hpa, ' hPa')}</strong></div>
-        <div class="route-row"><span>Temperatura</span><strong>${safeText(f.temperature_c, ' °C')}</strong></div>
-        <div class="route-row"><span>Fonte meteo</span><strong>${safeText(f.weather_source)}</strong></div>
-        <div class="route-row"><span>Fonte velocità tratto</span><strong>${safeText(f.segment_speed_source)}</strong></div>
-        <div class="route-row"><span>Polyline</span><strong>${route.map_polyline_available ? `${safeNum(route.polyline_points_count, 0)} punti` : 'assente'}</strong></div>
+      <div class="route-compact-metrics">
+        <div><span>Distanza</span><strong>${safeText(route.distance_km, ' km')}</strong></div>
+        <div><span>Dislivello</span><strong>${safeText(route.elevation_gain_m, ' m')}</strong></div>
+        <div><span>Pendenza max</span><strong>${safeText(f.max_slope_pct, '%')}</strong></div>
+        <div><span>Velocità media</span><strong>${safeText(route.average_speed_kmh, ' km/h')}</strong></div>
       </div>
-
-      <div class="slope-profile">
-        <span>Profilo pendenza</span>
-        <div class="slope-strip">${strip || '<span class="slope-color-na"></span>'}</div>
-        <div class="slope-legend">${legend}</div>
+      <div class="route-compact-meta">
+        <span>${safeText(route.import_user_label)}</span>
+        <span>${safeText(route.source_label)}</span>
+        <span class="${trackQuality.status === 'warning' || trackAlignment.status === 'warning' ? 'route-alert' : ''}">${trackQuality.status === 'warning' || trackAlignment.status === 'warning' ? 'Verifica traccia' : 'Traccia verificata'}</span>
+        <strong>Apri dettagli</strong>
       </div>
-
-      <details>
-        <summary>Dettaglio calcolo Street Skate</summary>
-        <pre>${escapeHtml(JSON.stringify(b, null, 2))}</pre>
-      </details>
     </article>
   `;
 }
@@ -499,7 +472,8 @@ function resetGpxProgress() {
 
 function bindDeleteButtons() {
   document.querySelectorAll('.route-delete').forEach(btn => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', async (event) => {
+      event.stopPropagation();
       const id = Number(btn.dataset.routeId);
       if (!id) return;
       btn.disabled = true;
@@ -515,6 +489,22 @@ function bindDeleteButtons() {
       } catch (err) {
         statusText.textContent = `Errore: ${err.message}`;
         btn.disabled = false;
+      }
+    });
+  });
+}
+
+function bindRouteCards() {
+  document.querySelectorAll('.route-card[data-route-href]').forEach(card => {
+    const open = () => { window.location.assign(card.dataset.routeHref); };
+    card.addEventListener('click', (event) => {
+      if (!event.target.closest('button, a, input, select, textarea')) open();
+    });
+    card.addEventListener('keydown', (event) => {
+      if (event.target !== card) return;
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        open();
       }
     });
   });
@@ -785,45 +775,63 @@ async function uploadGpx(ev) {
     if (gpxUploadState) gpxUploadState.textContent = 'Seleziona almeno un file GPX o JSON';
     return;
   }
+  const bundles = new Map();
+  files.forEach((file) => {
+    const match = /^(.*)\.(gpx|json)$/i.exec(file.name || '');
+    if (!match) return;
+    const item = bundles.get(match[1]) || [];
+    item.push(file);
+    bundles.set(match[1], item);
+  });
+  const groups = [...bundles.values()].filter((group) => group.some((file) => /\.gpx$/i.test(file.name)));
+  if (!groups.length) {
+    statusText.textContent = 'Errore: seleziona almeno un GPX, con il JSON opzionale omonimo';
+    if (gpxUploadState) gpxUploadState.textContent = 'Nessun bundle GPX valido selezionato';
+    return;
+  }
   uploadGpxBtn.disabled = true;
   let lastRoutes = [];
   let totalCached = 0;
   let imported = 0;
   let skippedFilename = 0;
-  let skippedContent = 0;
   let skippedShort = 0;
   let skippedWrongType = 0;
   let skippedShortNames = [];
   let skippedWrongTypeNames = [];
-  statusText.textContent = `Import in corso: 0/${files.length}`;
-  if (gpxUploadState) gpxUploadState.textContent = `Invio di ${files.length} file GPX/JSON in corso...`;
-  setGpxProgress(0, files.length, `0 / ${files.length} file`);
+  let processedBundles = 0;
+  const batches = [];
+  for (let index = 0; index < groups.length; index += 5) batches.push(groups.slice(index, index + 5));
+  statusText.textContent = `Import in corso: 0/${groups.length} percorsi`;
+  if (gpxUploadState) gpxUploadState.textContent = `Preparazione di ${groups.length} bundle GPX/JSON...`;
+  setGpxProgress(0, groups.length, `0 / ${groups.length} percorsi`);
   try {
-    const fd = new FormData();
-    fd.append('csrf_token', csrfToken);
-    files.forEach((f) => fd.append('files', f));
-    statusText.textContent = `Import in corso: ${files.length} file`;
-    if (gpxUploadState) gpxUploadState.textContent = `Elaborazione batch di ${files.length} file GPX/JSON`;
-    const response = await fetch('/api/manual-import/gpx', { method: 'POST', headers: csrfHeaders(), body: fd });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Errore import GPX');
-    imported += Number(data.imported || 0);
-    skippedFilename += Number(data.skipped_filename || 0);
-    skippedContent += Number(data.skipped_content || 0);
-    skippedShort += Number(data.skipped_short || 0);
-    skippedWrongType += Number(data.skipped_wrong_type || 0);
-    skippedShortNames = skippedShortNames.concat(data.skipped_short_names || []);
-    skippedWrongTypeNames = skippedWrongTypeNames.concat(data.skipped_wrong_type_names || []);
-    totalCached = Number(data.total_cached || totalCached);
-    lastRoutes = data.routes || lastRoutes;
-    setGpxProgress(files.length, files.length, `${files.length} / ${files.length} file`);
+    for (const batch of batches) {
+      const fd = new FormData();
+      fd.append('csrf_token', csrfToken);
+      batch.flat().forEach((file) => fd.append('files', file));
+      statusText.textContent = `Import in corso: ${processedBundles}/${groups.length} percorsi`;
+      if (gpxUploadState) gpxUploadState.textContent = `Elaborazione percorsi ${processedBundles + 1}-${processedBundles + batch.length} di ${groups.length}`;
+      const response = await fetch('/api/manual-import/gpx', { method: 'POST', headers: csrfHeaders(), body: fd });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Errore import GPX');
+      imported += Number(data.imported || 0);
+      skippedFilename += Number(data.skipped_filename || 0);
+      skippedShort += Number(data.skipped_short || 0);
+      skippedWrongType += Number(data.skipped_wrong_type || 0);
+      skippedShortNames = skippedShortNames.concat(data.skipped_short_names || []);
+      skippedWrongTypeNames = skippedWrongTypeNames.concat(data.skipped_wrong_type_names || []);
+      totalCached = Number(data.total_cached || totalCached);
+      lastRoutes = data.routes || lastRoutes;
+      processedBundles += batch.length;
+      setGpxProgress(processedBundles, groups.length, `${processedBundles} / ${groups.length} percorsi`);
+    }
     allRoutes = lastRoutes;
     renderRoutes(allRoutes);
     const shortMsg = shortSkipMessage(skippedShort, skippedShortNames);
     const wrongTypeMsg = wrongTypeSkipMessage(skippedWrongType, skippedWrongTypeNames);
-    const bundleMsg = `${Number(data.processed_bundles || 0)} bundle GPX/JSON`;
-    statusText.textContent = `Importati ${imported} percorsi da ${bundleMsg}. Scartati nome=${skippedFilename}, contenuto=${skippedContent}${shortMsg}${wrongTypeMsg}. Totale cache: ${totalCached}`;
-    if (gpxUploadState) gpxUploadState.textContent = `Import completato: ${imported} percorsi da ${bundleMsg}, scartati nome=${skippedFilename}, contenuto=${skippedContent}${shortMsg}${wrongTypeMsg}, totale cache ${totalCached}`;
+    const bundleMsg = `${processedBundles} bundle GPX/JSON`;
+    statusText.textContent = `Importati ${imported} percorsi da ${bundleMsg}. Scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}. Totale cache: ${totalCached}`;
+    if (gpxUploadState) gpxUploadState.textContent = `Import completato: ${imported} percorsi da ${bundleMsg}, scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}, totale cache ${totalCached}`;
     gpxUploadForm.reset();
   } catch (err) {
     statusText.textContent = `Errore: ${err.message}`;

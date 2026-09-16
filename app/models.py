@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -11,6 +11,16 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     display_name: Mapped[str | None] = mapped_column(String(255))
+    first_name: Mapped[str | None] = mapped_column(String(120))
+    last_name: Mapped[str | None] = mapped_column(String(120))
+    birth_date: Mapped[date | None] = mapped_column(Date)
+    username: Mapped[str | None] = mapped_column(String(255), unique=True)
+    email: Mapped[str | None] = mapped_column(String(255), unique=True)
+    phone: Mapped[str | None] = mapped_column(String(64), unique=True)
+    role: Mapped[str | None] = mapped_column(String(32))
+    password_hash: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -18,6 +28,38 @@ class User(Base):
 
     connections: Mapped[list["AuthConnection"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     routes: Mapped[list["Route"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    registration_requests: Mapped[list["UserRegistrationRequest"]] = relationship(
+        back_populates="reviewed_by_user",
+        cascade="save-update",
+        foreign_keys=lambda: [UserRegistrationRequest.reviewed_by_user_id],
+    )
+
+
+class UserRegistrationRequest(Base):
+    __tablename__ = "user_registration_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_type: Mapped[str] = mapped_column(String(50), nullable=False, default="new_user")
+    first_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    birth_date: Mapped[date | None] = mapped_column(Date)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    review_notes: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    reviewed_by_user: Mapped["User | None"] = relationship(
+        foreign_keys=lambda: [UserRegistrationRequest.reviewed_by_user_id],
+        back_populates="registration_requests",
+    )
 
 
 class AuthConnection(Base):
