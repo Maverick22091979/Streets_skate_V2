@@ -1,7 +1,17 @@
 $ErrorActionPreference = "Stop"
 
 $dockerDesktop = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
+if (-not (Test-Path (Join-Path $projectRoot ".env"))) {
+    throw "Configurazione locale mancante: .env. Creala con: Copy-Item .env.example .env. Poi configura i file richiesti in docker/secrets (vedi README.md)."
+}
+
+$requiredSecrets = "postgres_password", "database_url", "app_secret_key", "admin_password"
+$missingSecrets = $requiredSecrets | Where-Object { -not (Test-Path (Join-Path $projectRoot "docker/secrets/$_")) }
+if ($missingSecrets) {
+    throw "Secret Docker mancanti in docker/secrets: $($missingSecrets -join ', '). Segui la sezione 'Avvio rapido' del README.md per crearli."
+}
 
 function Test-DockerReady {
     try {

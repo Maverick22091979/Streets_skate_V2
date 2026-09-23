@@ -17,15 +17,43 @@ Web app FastAPI con login OAuth, import percorsi sportivi e persistenza su Postg
 
 ## Avvio rapido
 
-1. Copia `.env.example` in `.env`
-2. Inserisci le credenziali OAuth che hai
-3. Avvia:
+1. Copia `.env.example` in `.env`:
+
+```bash
+cp .env.example .env
+```
+
+2. Crea i secret locali richiesti da Docker. Sostituisci `SCEGLI_...` con valori sicuri; la password PostgreSQL deve essere identica in entrambi i file indicati.
+
+```bash
+mkdir -p docker/secrets
+printf '%s' 'SCEGLI_PASSWORD_POSTGRES' > docker/secrets/postgres_password
+printf '%s' 'postgresql+psycopg://street_skate:SCEGLI_PASSWORD_POSTGRES@db:5432/street_skate' > docker/secrets/database_url
+openssl rand -hex 32 > docker/secrets/app_secret_key
+printf '%s' 'SCEGLI_PASSWORD_ADMIN' > docker/secrets/admin_password
+chmod 600 docker/secrets/{postgres_password,database_url,app_secret_key,admin_password}
+```
+
+3. Inserisci le credenziali OAuth che hai in `.env`.
+4. Avvia:
 
 ```bash
 docker compose up --build
 ```
 
-4. Apri:
+In alternativa, gli script che avviano Docker quando possibile sono divisi per sistema operativo:
+
+```powershell
+# Windows (da PowerShell)
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\start-local.ps1
+```
+
+```bash
+# Linux
+./scripts/linux/start-local.sh
+```
+
+5. Apri:
 
 ```text
 http://localhost:5000

@@ -565,12 +565,13 @@ def add_operational_notes(doc: Document):
         ],
     )
 
-    doc.add_heading("8.1 Avvio locale con Docker Desktop", level=2)
+    doc.add_heading("8.1 Avvio locale con Docker", level=2)
     add_bullets(
         doc,
         [
-            "Il file start-local.ps1, nella cartella principale del progetto, avvia Docker Desktop se non e gia disponibile, attende il daemon Docker e avvia docker compose up --build.",
-            "Da PowerShell eseguire: powershell -ExecutionPolicy Bypass -File .\\start-local.ps1.",
+            "Gli script di avvio sono divisi per sistema operativo: scripts/windows/start-local.ps1 per Windows e scripts/linux/start-local.sh per Linux. Entrambi attendono il daemon Docker e avviano docker compose up --build.",
+            "Su Windows, da PowerShell eseguire: powershell -ExecutionPolicy Bypass -File .\\scripts\\windows\\start-local.ps1.",
+            "Su Linux eseguire: ./scripts/linux/start-local.sh.",
             "Al termine dell'avvio, l'app e disponibile su http://localhost:5000. Per fermarla usare Ctrl+C nella finestra dello script.",
         ],
     )
