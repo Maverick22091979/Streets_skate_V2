@@ -1,0 +1,14 @@
+.coverage-panel { padding: 20px; border-radius: 20px; background: #fff; }
+.coverage-toolbar { flex-wrap: wrap; }
+.coverage-toolbar label { display: flex; align-items: center; gap: 8px; }
+.coverage-toolbar input { width: auto; margin: 0; }
+#coverageStatus { color: var(--muted); line-height: 1.5; }
+#coverageMap { width: 100%; height: 65vh; min-height: 380px; border-radius: 14px; }
+.coverage-legend { max-width: 760px; padding-top: 20px; font-size: 14px; line-height: 1.5; }
+.coverage-gradient { height: 16px; margin-top: 12px; border-radius: 6px; background: linear-gradient(90deg, #2563eb, #06b6d4 25%, #22c55e 50%, #facc15 75%, #dc2626); }
+.coverage-ticks { display: flex; justify-content: space-between; margin-top: 4px; }
+.coverage-legend p { color: var(--muted); margin-bottom: 0; }
+@media (max-width: 700px) {
+  .coverage-panel { padding: 12px; }
+  #coverageMap { height: 60vh; min-height: 320px; }
+}

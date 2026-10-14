@@ -9,6 +9,19 @@
   let closing = false;
   let activeRequests = 0;
 
+  const beginTask = () => {
+    activeRequests += 1;
+    lastActivity = Date.now();
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      activeRequests = Math.max(0, activeRequests - 1);
+      lastActivity = Date.now();
+    };
+  };
+  window.sessionGuard = { beginTask };
+
   const isInternalRequest = (input) => {
     const target = input instanceof Request ? input.url : String(input);
     try {
@@ -23,12 +36,8 @@
     const input = args[0];
     const isSessionClose = isInternalRequest(input) && new URL(input instanceof Request ? input.url : String(input), window.location.href).pathname === '/session/close-tab';
     if (!isInternalRequest(input) || isSessionClose) return nativeFetch(...args);
-    activeRequests += 1;
-    lastActivity = Date.now();
-    return nativeFetch(...args).finally(() => {
-      activeRequests = Math.max(0, activeRequests - 1);
-      lastActivity = Date.now();
-    });
+    const end = beginTask();
+    return nativeFetch(...args).finally(end);
   };
 
   const closeSession = (reason, redirect = false) => {

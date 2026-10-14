@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Mappa frequenze - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/css/coverage.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+</head>
+<body>
+  <main class="dashboard-page">
+    <section class="dashboard-shell">
+      <div class="dashboard-header">
+        <div>
+          <a class="back-link" href="/dashboard">Torna alla dashboard</a>
+          <h1>Mappa frequenze</h1>
+          <p>Tutte le pattinate dell'archivio, sovrapposte per tratto.</p>
+        </div>
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Logout</button>
+        </form>
+      </div>
+      <section class="coverage-panel" aria-label="Frequenza dei passaggi">
+        <div class="toolbar coverage-toolbar">
+          <button id="fitCoverage" type="button" disabled>Inquadra tutti i percorsi</button>
+          <button id="reloadCoverage" type="button">Aggiorna</button>
+          <label><input id="showCoverage" type="checkbox" checked> Mostra passaggi</label>
+        </div>
+        <p id="coverageStatus" role="status" aria-live="polite">Caricamento delle pattinate…</p>
+        <div id="coverageMap" aria-label="Mappa interattiva dei passaggi" tabindex="0"></div>
+        <div class="coverage-legend" aria-label="Legenda frequenze">
+          <strong>Pattinate che attraversano il tratto / totale pattinate</strong>
+          <div class="coverage-gradient" aria-hidden="true"></div>
+          <div class="coverage-ticks"><span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+          <p>Dal blu (passaggi rari) al rosso (tutte le pattinate). Tocca un tratto per leggere percentuale e numero di pattinate.</p>
+          <p><strong>Senza colore: nessun passaggio registrato.</strong> Esplora la mappa per individuare le zone da percorrere; puoi nascondere i passaggi per leggere meglio le strade.</p>
+          <p id="coverageMethod">Ogni pattinata conta una sola volta per tratto, in entrambi i sensi. Le frequenze sono stime basate sulle tracce GPS, senza aggancio alla rete stradale.</p>
+        </div>
+      </section>
+    </section>
+  </main>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="/static/js/session-guard.js?v={{ asset_version }}" data-session-guard data-csrf="{{ csrf_token }}" data-timeout="{{ session_inactivity_timeout_sec }}"></script>
+  <script src="/static/js/coverage.js?v={{ asset_version }}"></script>
+</body>
+</html>

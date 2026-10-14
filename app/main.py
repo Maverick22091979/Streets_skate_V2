@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import env_bool, env_float, env_int, env_value
+from app.coverage import build_coverage
 from app.db import Base, SessionLocal, engine, get_db
 from app.gpx_import import _declared_difficulty_from_filename, parse_gpx_bytes
 from app.models import AuditLog, AuthConnection, Route, User, UserRegistrationRequest
@@ -3502,6 +3503,49 @@ def admin_update_route_type(route_id: int, request: Request, sport_type: str = F
         f"/admin/route-types?status={quote(f'Tipologia aggiornata per percorso {route.id}')}",
         status_code=303,
     )
+
+
+@app.get("/coverage", response_class=HTMLResponse)
+def coverage_page(request: Request, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        return RedirectResponse("/change-password", status_code=303)
+    if not _get_local_admin(request):
+        user, conn = _get_session_user(request, db)
+        if not user or not conn:
+            return RedirectResponse("/", status_code=303)
+    return templates.TemplateResponse(
+        "coverage.html",
+        {
+            "request": request,
+            "app_name": APP_NAME,
+            "asset_version": ASSET_VERSION,
+            **_csrf_ctx(request),
+        },
+    )
+
+
+@app.get("/api/coverage")
+def api_coverage(request: Request, db: Session = Depends(get_db)):
+    if _must_change_password(request):
+        raise HTTPException(status_code=403, detail="Cambio password richiesto")
+    if not _get_local_admin(request):
+        user, conn = _get_session_user(request, db)
+        if not user or not conn:
+            raise HTTPException(status_code=401, detail="Sessione non autenticata")
+    tracks = []
+    for enrichment, polyline in db.execute(select(Route.enrichment, Route.summary_polyline)):
+        points = _route_points_from_enrichment(enrichment)
+        if len(points) >= 2:
+            tracks.append([(p.get("lat"), p.get("lng")) if isinstance(p, dict) else None for p in points])
+        else:
+            try:
+                tracks.append(_decode_polyline(polyline or ""))
+            except (IndexError, TypeError, ValueError):
+                tracks.append([])
+    try:
+        return JSONResponse(build_coverage(tracks), headers={"Cache-Control": "no-store"})
+    finally:
+        request.session["session_last_seen_at"] = time.time()
 
 
 @app.get("/routes/{route_id}", response_class=HTMLResponse)

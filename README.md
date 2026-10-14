@@ -68,6 +68,14 @@ python run.py
 
 Serve un PostgreSQL raggiungibile dal `DATABASE_URL`.
 
+## Mappa frequenze
+
+Dalla dashboard, **Mappa frequenze** apre `/coverage`: mappa con zoom, legenda e percentuali cliccabili per tratto sull'intero archivio.
+La frequenza è il numero di pattinate distinte sul tratto diviso il totale delle pattinate, comprese quelle senza GPS utilizzabile. Ripassare sul tratto nella stessa attività conta una sola volta, in entrambi i sensi.
+Il confronto usa una tolleranza GPS di 12 m, senza aggancio alla rete stradale; strade parallele molto vicine possono essere accorpate. Salti tra punti oltre 250 m vengono esclusi. Le strade senza colore non hanno passaggi registrati nell'archivio.
+
+Verifica: `python -m unittest discover -s tests -v`.
+
 ## Variabili chiave
 
 - `DATABASE_URL`

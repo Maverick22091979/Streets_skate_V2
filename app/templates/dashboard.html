@@ -16,6 +16,7 @@
           <p>Utente: <strong>{{ user.provider_label }}</strong></p>
         </div>
         <div class="header-actions">
+          <a class="header-link" href="/coverage">Mappa frequenze</a>
           {% if not user.is_admin %}
           {% if user.support_available %}
           <a class="header-link" href="/support">Supporta</a>
