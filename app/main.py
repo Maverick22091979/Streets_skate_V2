@@ -15,7 +15,7 @@ from urllib.request import urlopen
 
 import httpx
 import stripe
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -25,7 +25,8 @@ from sqlalchemy.orm import Session, configure_mappers
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import env_bool, env_float, env_int, env_value
-from app.coverage import build_coverage
+from app.coverage import track_coords, track_lines
+from app.coverage_store import CoverageCache, route_geometry_query
 from app.db import Base, SessionLocal, engine, get_db
 from app.gpx_import import _declared_difficulty_from_filename, parse_gpx_bytes
 from app.models import AuditLog, AuthConnection, Payment, Route, User, UserRegistrationRequest
@@ -100,6 +101,7 @@ templates = Jinja2Templates(directory="app/templates")
 templates.env.globals["session_inactivity_timeout_sec"] = SESSION_INACTIVITY_TIMEOUT_SEC
 
 PROVIDERS = build_provider_registry(BASE_URL)
+_coverage_cache = CoverageCache(SessionLocal, lambda line: _decode_polyline(line))
 BASE_SKATE_WEIGHTS = {
     "max_slope": env_int("DIFFICULTY_WEIGHT_MAX_SLOPE", 25),
     "weighted_slope": env_int("DIFFICULTY_WEIGHT_WEIGHTED_SLOPE", 25),
@@ -239,6 +241,7 @@ def startup() -> None:
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS geo_longitude DOUBLE PRECISION"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS geo_org VARCHAR(255)"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS geo_asn VARCHAR(64)"))
+    _coverage_cache.warm()
 
 
 @app.middleware("http")
@@ -2397,6 +2400,7 @@ def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dic
         route.raw_payload = item["raw_payload"]
         saved.append(route)
     db.commit()
+    _coverage_cache.warm()
     stmt = select(Route).where(Route.user_id == user.id).order_by(Route.start_date_local.desc().nullslast(), Route.id.desc())
     return list(db.execute(stmt).scalars())
 
@@ -3744,26 +3748,43 @@ def coverage_page(request: Request, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/api/coverage")
-def api_coverage(request: Request, db: Session = Depends(get_db)):
+def _require_coverage_access(request: Request, db: Session):
     if _must_change_password(request):
         raise HTTPException(status_code=403, detail="Cambio password richiesto")
     if not _get_local_admin(request):
         user, conn = _get_session_user(request, db)
         if not user or not conn:
             raise HTTPException(status_code=401, detail="Sessione non autenticata")
-    tracks = []
-    for enrichment, polyline in db.execute(select(Route.enrichment, Route.summary_polyline)):
-        points = _route_points_from_enrichment(enrichment)
-        if len(points) >= 2:
-            tracks.append([(p.get("lat"), p.get("lng")) if isinstance(p, dict) else None for p in points])
-        else:
-            try:
-                tracks.append(_decode_polyline(polyline or ""))
-            except (IndexError, TypeError, ValueError):
-                tracks.append([])
+
+
+@app.get("/api/coverage/tracks")
+def api_coverage_tracks(
+    request: Request,
+    after_id: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    _require_coverage_access(request, db)
+    rows = list(db.execute(route_geometry_query().where(Route.id > after_id).limit(limit + 1)))
+    page = rows[:limit]
+    lines = [line for _, pts, polyline in page for line in track_lines(track_coords(pts, polyline, _decode_polyline))]
+    return JSONResponse({
+        "geojson": {"type": "Feature", "properties": {}, "geometry": {"type": "MultiLineString", "coordinates": lines}},
+        "loaded_routes": len(page),
+        "next_after": page[-1][0] if page else after_id,
+        "has_more": len(rows) > limit,
+    }, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/coverage")
+def api_coverage(request: Request, db: Session = Depends(get_db)):
+    _require_coverage_access(request, db)
     try:
-        return JSONResponse(build_coverage(tracks), headers={"Cache-Control": "no-store"})
+        data, status = _coverage_cache.get(db)
+        headers = {"Cache-Control": "no-store"}
+        if status == 202:
+            headers["Retry-After"] = str(data["retry_after"])
+        return JSONResponse(data, status_code=status, headers=headers)
     finally:
         request.session["session_last_seen_at"] = time.time()
 
@@ -3821,6 +3842,7 @@ def api_delete_route(route_id: int, request: Request, db: Session = Depends(get_
     route_name = route.name
     db.delete(route)
     db.commit()
+    _coverage_cache.warm()
     routes = [_serialize_route(r) for r in _all_routes(db)]
     _write_audit_log(db, request, "delete_route", meta={"route_id": route_id, "route_name": route_name, "total_cached": len(routes)})
     payload: dict[str, Any] = {"deleted": route_id, "total_cached": len(routes), "routes": routes}

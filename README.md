@@ -71,10 +71,11 @@ Serve un PostgreSQL raggiungibile dal `DATABASE_URL`.
 ## Mappa frequenze
 
 Dalla dashboard, **Mappa frequenze** apre `/coverage`: mappa con zoom, legenda e percentuali cliccabili per tratto sull'intero archivio.
+I tracciati già nel DB vengono caricati progressivamente, senza attendere il calcolo: in anteprima sono grigi. Le frequenze vengono preparate in background all'avvio e dopo import/cancellazioni, salvate nella tabella `coverage_snapshots` e riutilizzate finché l'archivio non cambia. La tabella viene creata automaticamente all'avvio. Nessuna chiamata ai provider è necessaria.
 La frequenza è il numero di pattinate distinte sul tratto diviso il totale delle pattinate, comprese quelle senza GPS utilizzabile. Ripassare sul tratto nella stessa attività conta una sola volta, in entrambi i sensi.
 Il confronto usa una tolleranza GPS di 12 m, senza aggancio alla rete stradale; strade parallele molto vicine possono essere accorpate. Salti tra punti oltre 250 m vengono esclusi. Le strade senza colore non hanno passaggi registrati nell'archivio.
 
-Verifica: `python -m unittest discover -s tests -v`.
+Verifica: `python -m unittest discover -s tests -v` e `node --test tests/coverage.test.cjs tests/session_guard.test.cjs`.
 
 ## Variabili chiave
 

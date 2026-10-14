@@ -150,6 +150,14 @@ class Payment(Base):
     user: Mapped["User"] = relationship(back_populates="payments")
 
 
+class CoverageSnapshot(Base):
+    __tablename__ = "coverage_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    signature: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

@@ -65,8 +65,8 @@ def build_coverage(tracks):
     groups = defaultdict(list)
     drawn = set()
     for rid, a, b, v in edges:
-        c, d = unproject(a), unproject(b)
-        key = tuple(sorted((tuple(c), tuple(d))))
+        start, end = unproject(a), unproject(b)
+        key = tuple(sorted((tuple(start), tuple(end))))
         if key in drawn:
             continue
         drawn.add(key)
@@ -86,7 +86,7 @@ def build_coverage(tracks):
             if len(matches) == 1:
                 break
         count = len(matches)
-        groups[count].append([c, d])
+        groups[count].append([start, end])
 
     total = len(tracks)
     return {
@@ -108,3 +108,38 @@ def build_coverage(tracks):
             ],
         },
     }
+
+
+def track_coords(points, polyline, decode):
+    pts = [
+        _coord((p.get("lat"), p.get("lng"))) if isinstance(p, dict) else None
+        for p in points
+    ] if isinstance(points, list) else []
+    if sum(p is not None for p in pts) >= 2:
+        return pts
+    try:
+        return [_coord(p) for p in decode(polyline or "")]
+    except (IndexError, TypeError, ValueError):
+        return []
+
+
+def track_lines(points):
+    lines = []
+    line = []
+    prev = None
+    for p in points:
+        gap = False
+        if p and prev:
+            dx = (p[1] - prev[1]) * 111195 * math.cos(math.radians((p[0] + prev[0]) / 2))
+            dy = (p[0] - prev[0]) * 111195
+            gap = math.hypot(dx, dy) > MAX_GAP_M
+        if p is None or gap:
+            if len(line) >= 2:
+                lines.append(line)
+            line = []
+        if p:
+            line.append([p[1], p[0]])
+        prev = p
+    if len(line) >= 2:
+        lines.append(line)
+    return lines
