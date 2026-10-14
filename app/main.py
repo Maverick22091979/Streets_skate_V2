@@ -6,7 +6,7 @@ import json
 import time
 import uuid
 import ipaddress
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -21,14 +21,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, configure_mappers
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import env_bool, env_float, env_int, env_value
 from app.coverage import build_coverage
 from app.db import Base, SessionLocal, engine, get_db
 from app.gpx_import import _declared_difficulty_from_filename, parse_gpx_bytes
-from app.models import AuditLog, AuthConnection, Route, User, UserRegistrationRequest
+from app.models import AuditLog, AuthConnection, Payment, Route, User, UserRegistrationRequest
 from app.osm import fetch_surface_profile
 from app.providers import ProviderAdapter, build_provider_registry
 from app.slope import smooth_elevations, trend_metrics
@@ -61,7 +61,14 @@ RESEND_FROM_EMAIL = env_value("RESEND_FROM_EMAIL", "")
 RESEND_FROM_NAME = env_value("RESEND_FROM_NAME", "Street Skate")
 RESEND_REPLY_TO = env_value("RESEND_REPLY_TO", "")
 STRIPE_SECRET_KEY = env_value("STRIPE_SECRET_KEY", "")
-STRIPE_SUPPORT_PRICE_ID = env_value("STRIPE_SUPPORT_PRICE_ID", "")
+STRIPE_PREMIUM_PRICE_ID = env_value("STRIPE_PREMIUM_PRICE_ID", env_value("STRIPE_SUPPORT_PRICE_ID", ""))
+PAYPAL_CLIENT_ID = env_value("PAYPAL_CLIENT_ID", "")
+PAYPAL_CLIENT_SECRET = env_value("PAYPAL_CLIENT_SECRET", "")
+PAYPAL_API_BASE = env_value("PAYPAL_API_BASE", "https://api-m.sandbox.paypal.com").rstrip("/")
+PAYPAL_PREMIUM_AMOUNT = env_value("PAYPAL_PREMIUM_AMOUNT", "")
+PAYPAL_PREMIUM_CURRENCY = env_value("PAYPAL_PREMIUM_CURRENCY", "EUR").upper()
+PREMIUM_DURATION_DAYS = max(1, env_int("PREMIUM_DURATION_DAYS", 365))
+PREMIUM_TERMS_VERSION = env_value("PREMIUM_TERMS_VERSION", "premium-v1")
 ADIDAS_EXPORT_DIR = env_value("ADIDAS_EXPORT_DIR", "data/export/Sport-sessions/GPS-data")
 ADIDAS_EXPORT_USER_DIR = env_value("ADIDAS_EXPORT_USER_DIR", "data/export/User")
 MIN_IMPORT_DISTANCE_M = env_float("MIN_IMPORT_DISTANCE_M", 500)
@@ -113,20 +120,20 @@ VIEWER_SETTINGS = {
 LOCAL_ACCOUNT_ROLES = {"admin", "skater"}
 DEFAULT_PROVIDER_VISIBILITY = {
     "strava": True,
-    "adidas": False,
-    "mapmyrun": False,
+    "adidas": True,
+    "mapmyrun": True,
     "suunto": True,
-    "runkeeper": False,
-    "garmin": False,
+    "runkeeper": True,
+    "garmin": True,
     "inline_route_tracking": False,
 }
 DEFAULT_PROVIDER_ENABLED = {
     "strava": True,
-    "adidas": False,
-    "mapmyrun": False,
-    "suunto": False,
-    "runkeeper": False,
-    "garmin": False,
+    "adidas": True,
+    "mapmyrun": True,
+    "suunto": True,
+    "runkeeper": True,
+    "garmin": True,
     "inline_route_tracking": False,
 }
 PROVIDER_BUTTON_SETTINGS: dict[str, dict[str, bool]] = {
@@ -196,6 +203,7 @@ SECURITY_HEADERS = {
 
 @app.on_event("startup")
 def startup() -> None:
+    configure_mappers()
     Base.metadata.create_all(bind=engine)
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(120)"))
@@ -208,6 +216,9 @@ def startup() -> None:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS ad_free_until TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS consent_version VARCHAR(32)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username_unique ON users (username) WHERE username IS NOT NULL"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email_unique ON users (email) WHERE email IS NOT NULL"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_phone_unique ON users (phone) WHERE phone IS NOT NULL"))
@@ -1804,6 +1815,8 @@ def _provider_meta() -> dict[str, dict[str, Any]]:
         if not out["adidas"]["oauth_configured"]:
             out["adidas"]["mode"] = "export_only"
     for key, meta in out.items():
+        if key == "suunto":
+            meta["workout_api_configured"] = bool((PROVIDERS[key].cfg.extra or {}).get("subscription_key"))
         meta["implementation"] = _provider_implementation_status(key, meta)
     return out
 
@@ -1823,10 +1836,11 @@ def _provider_implementation_status(provider: str, meta: dict[str, Any]) -> dict
             "settings": "Configured" if oauth_ready else "Missing",
         }
     if provider == "suunto":
+        workout_ready = bool(meta.get("workout_api_configured"))
         return {
-            "login": "Review pending",
-            "auth": "Partner review in progress",
-            "settings": "Configured" if oauth_ready else "Missing",
+            "login": "Implemented",
+            "auth": "OAuth + Workout API" if oauth_ready and workout_ready else "Configuration in progress",
+            "settings": "Configured" if oauth_ready and workout_ready else ("Subscription key missing" if oauth_ready else "Missing"),
         }
     if provider == "runkeeper":
         return {
@@ -2686,47 +2700,162 @@ def _support_context(request: Request, db: Session) -> tuple[User, AuthConnectio
     return (user, conn) if user and conn else None
 
 
+def _stripe_premium_ready() -> bool:
+    return bool(STRIPE_SECRET_KEY and STRIPE_PREMIUM_PRICE_ID)
+
+
+def _paypal_premium_ready() -> bool:
+    return bool(PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET and PAYPAL_PREMIUM_AMOUNT)
+
+
+def _stripe_price_label() -> str:
+    if not _stripe_premium_ready():
+        return "Importo da configurare"
+    try:
+        stripe.api_key = STRIPE_SECRET_KEY
+        price = stripe.Price.retrieve(STRIPE_PREMIUM_PRICE_ID)
+        if price.unit_amount is not None:
+            return f"{price.unit_amount / 100:.2f} {(price.currency or 'EUR').upper()}"
+    except stripe.StripeError:
+        pass
+    return "Importo disponibile al checkout Stripe"
+
+
+def _paypal_price_label() -> str:
+    if not _paypal_premium_ready():
+        return "Importo da configurare"
+    try:
+        return f"{float(PAYPAL_PREMIUM_AMOUNT):.2f} {PAYPAL_PREMIUM_CURRENCY}"
+    except ValueError:
+        return "Importo non valido"
+
+
+def _premium_until(user: User) -> datetime:
+    now = datetime.now(UTC)
+    current = user.ad_free_until
+    if current and current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return max(now, current or now) + timedelta(days=PREMIUM_DURATION_DAYS)
+
+
+def _record_payment(
+    db: Session,
+    user: User,
+    provider: str,
+    external_id: str,
+    status: str,
+    amount_cents: int | None = None,
+    currency: str | None = None,
+    payload: dict | list | None = None,
+    consent: bool = False,
+) -> Payment:
+    row = db.execute(
+        select(Payment).where(Payment.provider == provider, Payment.external_id == external_id)
+    ).scalar_one_or_none()
+    if not row:
+        row = Payment(
+            user_id=user.id,
+            account_email=(user.email or "").strip().lower(),
+            provider=provider,
+            external_id=external_id,
+            status=status,
+            amount_cents=amount_cents,
+            currency=currency,
+            raw_payload=payload,
+            consent_at=datetime.now(UTC) if consent else None,
+            consent_version=PREMIUM_TERMS_VERSION if consent else None,
+        )
+        db.add(row)
+    else:
+        if row.user_id != user.id or row.account_email != (user.email or "").strip().lower():
+            raise ValueError("Pagamento associato a un altro account")
+        row.status = status
+        row.amount_cents = amount_cents if amount_cents is not None else row.amount_cents
+        row.currency = currency or row.currency
+        row.raw_payload = payload or row.raw_payload
+        if consent and not row.consent_at:
+            row.consent_at = datetime.now(UTC)
+            row.consent_version = PREMIUM_TERMS_VERSION
+    if status == "paid":
+        row.paid_at = row.paid_at or datetime.now(UTC)
+        row.premium_until = row.premium_until or _premium_until(user)
+        user.ad_free_until = max(user.ad_free_until or row.premium_until, row.premium_until)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def _support_template_context(request: Request, user: User, conn: AuthConnection, **extra: Any) -> dict[str, Any]:
+    ad_free_until = user.ad_free_until
+    if ad_free_until and ad_free_until.tzinfo is None:
+        ad_free_until = ad_free_until.replace(tzinfo=UTC)
+    return {
+        "request": request,
+        "app_name": APP_NAME,
+        "asset_version": ASSET_VERSION,
+        "user": _current_provider_context(conn),
+        "account_email": user.email or "",
+        "stripe_available": _stripe_premium_ready(),
+        "paypal_available": _paypal_premium_ready(),
+        "stripe_price_label": _stripe_price_label(),
+        "paypal_price_label": _paypal_price_label(),
+        "premium_duration_days": PREMIUM_DURATION_DAYS,
+        "premium_until": ad_free_until.astimezone().strftime("%d/%m/%Y") if ad_free_until and ad_free_until > datetime.now(UTC) else "",
+        **_csrf_ctx(request),
+        **extra,
+    }
+
+
 @app.get("/support", response_class=HTMLResponse)
 def support_page(request: Request, db: Session = Depends(get_db)):
     current = _support_context(request, db)
     if not current:
         return RedirectResponse("/dashboard", status_code=303)
     user, conn = current
+    if not user.email:
+        return RedirectResponse(f"/dashboard?error={quote('Per il pagamento serve un account con e-mail registrata')}", status_code=303)
     return templates.TemplateResponse(
         "support.html",
-        {
-            "request": request,
-            "app_name": APP_NAME,
-            "asset_version": ASSET_VERSION,
-            "user": _current_provider_context(conn),
-            "configured": bool(STRIPE_SECRET_KEY and STRIPE_SUPPORT_PRICE_ID),
-            "status": request.query_params.get("status"),
-            "error": request.query_params.get("error"),
-            **_csrf_ctx(request),
-        },
+        _support_template_context(request, user, conn, status=request.query_params.get("status"), error=request.query_params.get("error")),
     )
 
 
+def _payment_consent_valid(terms_accepted: str, payment_authorized: str) -> bool:
+    return terms_accepted == "accepted" and payment_authorized == "accepted"
+
+
 @app.post("/support/checkout")
-def support_checkout(request: Request, csrf_token: str = Form(...), db: Session = Depends(get_db)):
+def support_checkout(
+    request: Request,
+    csrf_token: str = Form(...),
+    terms_accepted: str = Form(""),
+    payment_authorized: str = Form(""),
+    db: Session = Depends(get_db),
+):
     _require_csrf(request, csrf_token)
     current = _support_context(request, db)
     if not current:
         return RedirectResponse("/dashboard", status_code=303)
-    if not STRIPE_SECRET_KEY or not STRIPE_SUPPORT_PRICE_ID:
+    if not _stripe_premium_ready():
         return RedirectResponse("/support?error=Supporto Stripe non configurato", status_code=303)
+    if not _payment_consent_valid(terms_accepted, payment_authorized):
+        return RedirectResponse("/support?error=Conferma i consensi prima di continuare", status_code=303)
     user, _ = current
+    if not user.email:
+        return RedirectResponse("/support?error=Account senza e-mail registrata", status_code=303)
     try:
         stripe.api_key = STRIPE_SECRET_KEY
         checkout = stripe.checkout.Session.create(
             mode="payment",
-            line_items=[{"price": STRIPE_SUPPORT_PRICE_ID, "quantity": 1}],
+            line_items=[{"price": STRIPE_PREMIUM_PRICE_ID, "quantity": 1}],
             success_url=f"{BASE_URL}/support/success?session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{BASE_URL}/support?status=Pagamento annullato",
             client_reference_id=str(user.id),
-            metadata={"street_skate_user_id": str(user.id), "purpose": "support"},
+            customer_email=user.email,
+            metadata={"street_skate_user_id": str(user.id), "street_skate_email": user.email, "purpose": "premium_ad_free"},
         )
-        _write_audit_log(db, request, "support_checkout_start", meta={"checkout_session_id": checkout.id, "user_id": user.id})
+        _record_payment(db, user, "stripe", checkout.id, "pending", consent=True)
+        _write_audit_log(db, request, "support_checkout_start", meta={"checkout_session_id": checkout.id, "user_id": user.id, "account_email": user.email})
         return RedirectResponse(checkout.url, status_code=303)
     except stripe.StripeError as exc:
         _write_audit_log(db, request, "support_checkout_start", error=str(exc), meta={"user_id": user.id})
@@ -2738,18 +2867,109 @@ def support_success(request: Request, session_id: str = "", db: Session = Depend
     current = _support_context(request, db)
     if not current:
         return RedirectResponse("/dashboard", status_code=303)
+    user, conn = current
     paid = False
     if STRIPE_SECRET_KEY and session_id:
         try:
             stripe.api_key = STRIPE_SECRET_KEY
             checkout = stripe.checkout.Session.retrieve(session_id)
-            paid = checkout.payment_status == "paid"
-        except stripe.StripeError:
-            pass
+            metadata = dict(checkout.metadata or {})
+            paid = checkout.payment_status == "paid" and str(checkout.client_reference_id or "") == str(user.id) and metadata.get("street_skate_email", "").lower() == (user.email or "").lower()
+            if paid:
+                _record_payment(db, user, "stripe", checkout.id, "paid", int(checkout.amount_total or 0), (checkout.currency or "").upper(), checkout.to_dict_recursive())
+                _write_audit_log(db, request, "support_payment_confirmed", meta={"provider": "stripe", "payment_id": checkout.id, "user_id": user.id})
+        except stripe.StripeError as exc:
+            _write_audit_log(db, request, "support_payment_verify", error=str(exc), meta={"provider": "stripe", "user_id": user.id})
     return templates.TemplateResponse(
         "support.html",
-        {"request": request, "app_name": APP_NAME, "asset_version": ASSET_VERSION, "user": _current_provider_context(current[1]), "configured": True, "paid": paid, "status": "Grazie per il supporto." if paid else "Pagamento non ancora confermato.", **_csrf_ctx(request)},
+        _support_template_context(request, user, conn, paid=paid, status="Pagamento confermato: Premium senza pubblicita attivo." if paid else "Pagamento non ancora confermato."),
     )
+
+
+def _paypal_token() -> str:
+    response = httpx.post(
+        f"{PAYPAL_API_BASE}/v1/oauth2/token",
+        auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+        data={"grant_type": "client_credentials"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    token = str(response.json().get("access_token") or "")
+    if not token:
+        raise ValueError("Token PayPal assente")
+    return token
+
+
+@app.post("/support/paypal/checkout")
+def paypal_checkout(
+    request: Request,
+    csrf_token: str = Form(...),
+    terms_accepted: str = Form(""),
+    payment_authorized: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    _require_csrf(request, csrf_token)
+    current = _support_context(request, db)
+    if not current:
+        return RedirectResponse("/dashboard", status_code=303)
+    if not _paypal_premium_ready():
+        return RedirectResponse("/support?error=PayPal non configurato", status_code=303)
+    if not _payment_consent_valid(terms_accepted, payment_authorized):
+        return RedirectResponse("/support?error=Conferma i consensi prima di continuare", status_code=303)
+    user, _ = current
+    if not user.email:
+        return RedirectResponse("/support?error=Account senza e-mail registrata", status_code=303)
+    try:
+        amount = f"{float(PAYPAL_PREMIUM_AMOUNT):.2f}"
+        token = _paypal_token()
+        response = httpx.post(
+            f"{PAYPAL_API_BASE}/v2/checkout/orders",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={
+                "intent": "CAPTURE",
+                "purchase_units": [{"reference_id": f"street-skate-{user.id}", "custom_id": str(user.id), "description": "Street Skate Premium senza pubblicita", "amount": {"currency_code": PAYPAL_PREMIUM_CURRENCY, "value": amount}}],
+                "application_context": {"return_url": f"{BASE_URL}/support/paypal/return", "cancel_url": f"{BASE_URL}/support?status=Pagamento annullato"},
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        order = response.json()
+        approval_url = next((item.get("href") for item in order.get("links", []) if item.get("rel") == "approve"), "")
+        if not approval_url:
+            raise ValueError("URL approvazione PayPal assente")
+        _record_payment(db, user, "paypal", str(order["id"]), "pending", int(round(float(amount) * 100)), PAYPAL_PREMIUM_CURRENCY, order, consent=True)
+        _write_audit_log(db, request, "support_checkout_start", meta={"provider": "paypal", "order_id": order["id"], "user_id": user.id, "account_email": user.email})
+        return RedirectResponse(approval_url, status_code=303)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        _write_audit_log(db, request, "support_checkout_start", error=str(exc), meta={"provider": "paypal", "user_id": user.id})
+        return RedirectResponse(f"/support?error={quote('Impossibile avviare il pagamento PayPal')}", status_code=303)
+
+
+@app.get("/support/paypal/return", response_class=HTMLResponse)
+def paypal_return(request: Request, token: str = "", db: Session = Depends(get_db)):
+    current = _support_context(request, db)
+    if not current:
+        return RedirectResponse("/dashboard", status_code=303)
+    user, conn = current
+    row = db.execute(select(Payment).where(Payment.provider == "paypal", Payment.external_id == token)).scalar_one_or_none()
+    if not row or row.user_id != user.id or row.account_email != (user.email or "").lower():
+        return RedirectResponse("/support?error=Ordine PayPal non valido", status_code=303)
+    try:
+        access_token = _paypal_token()
+        response = httpx.post(f"{PAYPAL_API_BASE}/v2/checkout/orders/{token}/capture", headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, timeout=15)
+        response.raise_for_status()
+        order = response.json()
+        unit = (order.get("purchase_units") or [{}])[0]
+        capture = ((unit.get("payments") or {}).get("captures") or [{}])[0]
+        amount = capture.get("amount") or {}
+        paid = order.get("status") == "COMPLETED" and unit.get("custom_id") == str(user.id) and amount.get("currency_code") == PAYPAL_PREMIUM_CURRENCY
+        if paid:
+            _record_payment(db, user, "paypal", token, "paid", int(round(float(amount.get("value", 0)) * 100)), PAYPAL_PREMIUM_CURRENCY, order)
+            _write_audit_log(db, request, "support_payment_confirmed", meta={"provider": "paypal", "order_id": token, "user_id": user.id})
+        return templates.TemplateResponse("support.html", _support_template_context(request, user, conn, paid=paid, status="Pagamento confermato: Premium senza pubblicita attivo." if paid else "Pagamento PayPal non confermato."))
+    except (httpx.HTTPError, ValueError) as exc:
+        _write_audit_log(db, request, "support_payment_verify", error=str(exc), meta={"provider": "paypal", "order_id": token, "user_id": user.id})
+        return RedirectResponse(f"/support?error={quote('Impossibile confermare il pagamento PayPal')}", status_code=303)
 
 
 @app.post("/change-password")
@@ -3070,7 +3290,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     ctx["import_allowed"] = conn.provider == "strava" and ctx["import_consent"] == "accepted"
     ctx["import_autostart"] = bool(request.session.pop("import_autostart", False))
     ctx["can_change_password"] = bool(_current_local_user(request, db))
-    ctx["support_available"] = bool(STRIPE_SECRET_KEY and STRIPE_SUPPORT_PRICE_ID)
+    ctx["support_available"] = True
     routes = [_serialize_route(r) for r in _all_routes(db)]
     return templates.TemplateResponse(
         "dashboard.html",

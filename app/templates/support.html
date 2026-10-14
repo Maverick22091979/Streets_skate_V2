@@ -13,20 +13,50 @@
       <a class="back-link" href="/dashboard">Torna alla dashboard</a>
       <div class="brand">
         <div class="brand-icon">SS</div>
-        <div><h1>Supporta Street Skate</h1><p>Un contributo volontario aiuta a coprire infrastruttura e integrazioni provider.</p></div>
+        <div><h1>Street Skate Premium</h1><p>Contribuisci ai costi della piattaforma e usa Street Skate senza pubblicita.</p></div>
       </div>
+      <section class="support-plan">
+        <span class="support-kicker">Piano Premium</span>
+        <strong>Navigazione senza pubblicita</strong>
+        <p>Validita: {{ premium_duration_days }} giorni dalla conferma del pagamento. Nessun rinnovo automatico.</p>
+      </section>
+      <section class="support-info-grid">
+        <article>
+          <h2>Cosa ottieni</h2>
+          <ul><li>Dashboard e percorsi senza annunci.</li><li>Accesso alle stesse funzioni del piano gratuito.</li><li>Contributo ai costi di hosting e provider.</li></ul>
+        </article>
+        <article>
+          <h2>Account associato</h2>
+          <p><strong>{{ account_email }}</strong></p>
+          <p>Il pagamento e il beneficio Premium vengono registrati solo su questo account.</p>
+        </article>
+      </section>
+      <section class="support-info-grid">
+        <article class="payment-method"><h2>Stripe</h2><strong>{{ stripe_price_label }}</strong><p>Carta e metodi disponibili nella pagina protetta Stripe.</p></article>
+        <article class="payment-method"><h2>PayPal</h2><strong>{{ paypal_price_label }}</strong><p>Pagamento e autorizzazione eseguiti nel sito ufficiale PayPal.</p></article>
+      </section>
       {% if error %}<div class="alert">{{ error }}</div>{% endif %}
       {% if status %}<div class="gpx-upload-state">{{ status }}</div>{% endif %}
+      {% if premium_until %}<p class="support-note">Premium attivo fino al {{ premium_until }}.</p>{% endif %}
       {% if paid %}
-      <p class="support-note">Il pagamento risulta confermato da Stripe.</p>
-      {% elif configured %}
-      <form class="admin-form" method="post" action="/support/checkout">
+      <p class="support-note">La ricevuta e stata registrata sull'account {{ account_email }}.</p>
+      {% elif stripe_available or paypal_available %}
+      <section class="support-process">
+        <h2>Prima di proseguire</h2>
+        <ol><li>Controlla il metodo e l'importo indicato sopra.</li><li>Conferma i consensi richiesti.</li><li>Completa il pagamento sul sito del provider scelto.</li><li>Al ritorno, Street Skate verifica l'esito e attiva Premium.</li></ol>
+      </section>
+      <form class="admin-form support-checkout-form" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit">Continua con Stripe</button>
+        <label class="support-consent"><input type="checkbox" name="terms_accepted" value="accepted" required> Ho letto durata, importo e condizioni del piano Premium; il pagamento non si rinnova automaticamente.</label>
+        <label class="support-consent"><input type="checkbox" name="payment_authorized" value="accepted" required> Autorizzo Street Skate ad associare la ricevuta e il beneficio Premium al mio account registrato.</label>
+        <p class="support-note">Prima della pubblicazione dei pagamenti reali devono essere disponibili Termini di servizio, Privacy Policy e condizioni di rimborso applicabili.</p>
+        <div class="support-actions">
+          {% if stripe_available %}<button type="submit" formaction="/support/checkout">Paga con Stripe</button>{% endif %}
+          {% if paypal_available %}<button type="submit" formaction="/support/paypal/checkout">Paga con PayPal</button>{% endif %}
+        </div>
       </form>
-      <p class="support-note">Il pagamento viene gestito interamente nella pagina sicura di Stripe.</p>
       {% else %}
-      <p class="support-note">Il supporto Stripe non è ancora configurato.</p>
+      <section class="support-process"><h2>Pagamenti in preparazione</h2><p>La pagina e pronta, ma Stripe e PayPal non hanno ancora credenziali e importi di produzione configurati. Nessun addebito e possibile in questa fase.</p></section>
       {% endif %}
     </section>
   </main>

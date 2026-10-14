@@ -514,7 +514,7 @@ def build_provider_registry(base_url: str) -> dict[str, ProviderAdapter]:
             redirect_uri=env_value("SUUNTO_REDIRECT_URI", f"{base_url}/auth/suunto/callback"),
             auth_url=env_value("SUUNTO_AUTH_URL", "https://cloudapi-oauth.suunto.com/oauth/authorize"),
             token_url=env_value("SUUNTO_TOKEN_URL", "https://cloudapi-oauth.suunto.com/oauth/token"),
-            scope=env_value("SUUNTO_SCOPE", "workout"),
+            scope=env_value("SUUNTO_SCOPE", ""),
             user_url=env_value("SUUNTO_USER_URL", ""),
             activities_url=env_value("SUUNTO_ACTIVITIES_URL", "https://cloudapi.suunto.com/v2/workouts"),
             revoke_url=env_value("SUUNTO_REVOKE_URL", ""),

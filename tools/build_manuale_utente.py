@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -118,12 +119,24 @@ def export_pdf():
     if not soffice:
         raise RuntimeError("LibreOffice soffice non disponibile: impossibile creare il PDF.")
 
-    result = subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(OUT.parent), str(OUT)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="street-skate-soffice-") as profile:
+        result = subprocess.run(
+            [
+                soffice,
+                f"-env:UserInstallation={Path(profile).as_uri()}",
+                "--headless",
+                "--norestore",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(OUT.parent),
+                str(OUT),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=90,
+        )
     if result.returncode or not PDF_OUT.is_file():
         details = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"Esportazione PDF non riuscita. {details}")
@@ -190,8 +203,8 @@ def add_title(doc: Document):
     meta = doc.add_table(rows=3, cols=2)
     set_table_layout(meta, [1.8, 4.7])
     rows = [
-        ("Versione documento", "4.1"),
-        ("Data", date(2026, 9, 16).strftime("%d/%m/%Y")),
+        ("Versione documento", "4.9"),
+        ("Data", date(2026, 9, 29).strftime("%d/%m/%Y")),
         ("Ambito", "Web app FastAPI Street Skate con provider Strava, adidas Running, MapMyRun, Suunto, Runkeeper, Garmin, Inline Route Tracking e accesso Admin"),
     ]
     for i, (a, b) in enumerate(rows):
@@ -245,7 +258,7 @@ def add_login_modes(doc: Document):
             "Strava: il pulsante apre la pagina ufficiale di login/autorizzazione del provider; l'utente inserisce lì le credenziali e il backend completa l'autenticazione OAuth tramite callback e token API.",
             "Se nel browser è già aperta una sessione Strava, il provider può riutilizzarla e mostrare subito il consenso senza ripresentare il form credenziali. Per test con un altro account conviene usare logout da Strava, finestra anonima o profilo browser separato.",
             "MapMyRun: se configurato, il pulsante apre la pagina ufficiale di login del provider; l'app non legge username e password ma riceve il token API dopo il consenso OAuth.",
-            "Suunto: il provider e predisposto nel progetto, ma al 19 agosto 2026 la richiesta partnership risulta inviata e in review da parte di Suunto, con finestra indicativa di risposta entro circa il 2 settembre 2026.",
+            "Suunto: OAuth e Workout API sono predisposti. La schermata provider mostra Configured solo quando client ID, client secret e subscription key sono disponibili; la conversione FIT completa resta una fase di implementazione successiva.",
             "Runkeeper: il provider e predisposto come integrazione legacy e va verificato sul campo prima di un uso reale.",
             "Garmin Connect: il supporto nel progetto è predisposto, ma al 3 agosto 2026 i servizi API Garmin risultano in migrazione secondo il team developer Garmin e non è stata comunicata una data di ripristino. L'attivazione reale resta quindi bloccata anche in presenza della configurazione locale.",
             "Inline Route Tracking: il provider è già predisposto nella schermata di login rapido ma resta in attesa delle API ufficiali di login/auth e dello schema callback dell'app Android.",
@@ -330,7 +343,7 @@ def add_user_dashboard(doc: Document):
             "Al login provider, la dashboard carica subito dal database l'archivio globale dei percorsi, non solo quelli dell'utente autenticato.",
             "Ogni utente autenticato consulta quindi lo stesso archivio globale dei percorsi gia presenti nel database.",
             "Per Strava con scope activity:read_all, l'import parte automaticamente dopo il callback OAuth; senza tale scope il catalogo resta in sola lettura.",
-            "Pulsante Supporta: resta inattivo finché Stripe non è configurato con chiave segreta e Price ID; quando disponibile apre una pagina dedicata e avvia un pagamento volontario tramite Stripe Checkout.",
+            "Pulsante Supporta: apre sempre Street Skate Premium, associato all'e-mail univoca dell'account autenticato. I singoli pulsanti Stripe e PayPal restano non disponibili finché il relativo provider non è configurato.",
             "Pulsante Ricarica cache locale per rileggere l'archivio globale gia salvato nel database.",
             "Barra di avanzamento che indica i percorsi trovati nell'archivio globale.",
             "Cinque riquadri riepilogativi: numero percorsi, distanza totale, difficoltà media, percorsi difficili, ultima importazione.",
@@ -374,6 +387,18 @@ def add_user_dashboard(doc: Document):
             "Mappa Leaflet con tracciato, marker di partenza e arrivo.",
             "Statistiche principali: distanza, dislivello, pendenza media, velocità media, difficoltà, data di importazione.",
             "Fallback su bounding box o vista iniziale se i punti del tracciato non sono disponibili.",
+        ],
+    )
+    doc.add_heading("4.5 Street Skate Premium", level=2)
+    add_bullets(
+        doc,
+        [
+            "La pagina Premium mostra l'e-mail registrata dell'account che riceverà il beneficio; nessun pagamento anonimo abilita la versione senza pubblicità.",
+            "Stripe Checkout crea una sessione con user ID ed e-mail dell'account nei metadati; il backend verifica entrambi al rientro prima di registrare il pagamento.",
+            "PayPal crea un ordine server-side vincolato al solo user ID autenticato; il backend acquisisce e verifica l'ordine al ritorno da PayPal.",
+            "Ogni operazione è salvata nella tabella payments con provider, ID esterno, e-mail account, importo, valuta, stato e data di scadenza Premium.",
+            "Un pagamento confermato abilita Premium senza pubblicità per PREMIUM_DURATION_DAYS, 365 giorni per impostazione predefinita. Le chiavi e gli importi restano disattivati finché non configurati tramite ambiente o Docker secrets.",
+            "La pagina Premium espone offerta, durata, e-mail account, importi Stripe e PayPal, processo di conferma e consensi obbligatori registrati con la versione PREMIUM_TERMS_VERSION prima dell'avvio del checkout.",
         ],
     )
 
@@ -499,7 +524,7 @@ def add_admin(doc: Document):
             "Punteggi Street Skate: i pesi dell'algoritmo base non sono modificabili dalla dashboard admin e il punteggio resta fisso una volta salvato sul percorso.",
             "Utenze locali: form admin per creare account applicativi di ruolo admin o skater con username, nome, email e cellulare; il sistema genera una password temporanea di primo accesso, prova a inviarla via Resend e mantiene l'elenco utenti locali gia registrati.",
             "Accettazione nuovi utenti: pannello admin con badge richieste In attesa di revisione, elenco richieste e link al dettaglio di ogni notifica di tipo Nuovo utente. Gli esiti sono In attesa di revisione, Eseguita: utenza creata o Rifiutata.",
-            "Pulsanti autenticazione provider: pannello admin con checkbox per decidere se ciascun provider OAuth deve essere visibile nella home e se il relativo pulsante deve risultare cliccabile. Il predefinito corrente mostra Strava abilitato e Suunto non cliccabile; gli altri provider sono nascosti e disabilitati.",
+            "Pulsanti autenticazione provider: pannello admin con checkbox per decidere se ciascun provider OAuth deve essere visibile nella home e se il relativo pulsante deve risultare cliccabile. Il predefinito corrente mostra adidas Running, Strava, MapMyRun, Suunto, Runkeeper e Garmin Connect visibili e abilitati; Inline Route Tracking resta nascosto e disabilitato in attesa delle API ufficiali.",
             "Controllo duplicati GPX: differenza distanza totale max, tolleranza estremi tracciato, controllo percorso invertito.",
             "Calcolo pendenze: finestra smoothing quota, lunghezza minima tratto, cap pendenza massima.",
             "Tipologia percorsi: tabella admin con ricerca testuale e salvataggio della tipologia per singolo percorso.",
@@ -683,7 +708,7 @@ def add_next_session_open_points(doc: Document):
             "Importare il GPX del giro di ieri e validare gli avvisi di perdita segnale GPS e coerenza OSM, verificando in particolare eventuali segmenti rettilinei tra ultimo punto GPS e riaggancio. Regolare le soglie per evitare falsi positivi dovuti a pause automatiche, viabilità non mappata o export con punti radi.",
             "Verificare se i percorsi storici già presenti nel profilo admin risultano coerenti e pienamente fruibili per tutte le utenze globali.",
             "Implementare una rotta admin dedicata alla visualizzazione globale dei percorsi GPX presenti nel database, con mappa unica, caricamento di tutti i tracciati e possibilità di zoom in e zoom out.",
-            "Mantenere in sospeso le integrazioni provider non ancora operative o in review, in particolare adidas Running, Garmin, Suunto e Inline Route Tracking, fino alla disponibilità di API o credenziali definitive. La richiesta credenziali MapMyRun e stata inviata: alla ricezione configurare client ID e secret, callback pubblico e test OAuth/workout.",
+            "Mantenere in sospeso le integrazioni provider non ancora operative o in review, in particolare adidas Running, Garmin e Inline Route Tracking, fino alla disponibilità di API o credenziali definitive. Per Suunto completare il test OAuth/Workout API e implementare l'import FIT/GPX prima dell'abilitazione agli utenti. La richiesta credenziali MapMyRun e stata inviata: alla ricezione configurare client ID e secret, callback pubblico e test OAuth/workout.",
         ],
     )
 
@@ -702,7 +727,7 @@ def add_provider_sustainability(doc: Document):
     rows = [
         ("Strava", "OAuth attivo; limiti atleti da verificare", "n.d.", "Mantenere attivo solo entro i limiti concessi dall'app Strava."),
         ("MapMyRun", "API promessa con MVP personale; uso multiutente e GPS da confermare", "USD 29,99/anno", "Sconto Ryan 25% già applicato nel link. Attendere conferma scritta prima dell'acquisto."),
-        ("Suunto", "Partner Program in review", "n.d.", "Attendere esito partnership, condizioni API e costi."),
+        ("Suunto", "OAuth e Workout API configurabili", "n.d.", "Completare test OAuth e import FIT/GPX prima di abilitarlo agli utenti."),
         ("Garmin", "Servizi API in migrazione", "n.d.", "Attendere ripresa servizi e condizioni Developer Program."),
         ("adidas Running", "OAuth/API in standby; export locale disponibile", "n.d.", "Mantenere l'export locale come alternativa senza costo API."),
         ("Inline Route Tracking", "In attesa API ufficiali", "n.d.", "Definire licenza, OAuth e schema dati con il team dell'app."),

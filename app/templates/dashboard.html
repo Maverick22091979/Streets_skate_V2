@@ -18,11 +18,7 @@
         <div class="header-actions">
           <a class="header-link" href="/coverage">Mappa frequenze</a>
           {% if not user.is_admin %}
-          {% if user.support_available %}
           <a class="header-link" href="/support">Supporta</a>
-          {% else %}
-          <span class="header-link header-link-disabled" aria-disabled="true" title="Supporto Stripe non ancora configurato">Supporta</span>
-          {% endif %}
           {% endif %}
           {% if user.can_change_password %}
           <a class="header-link" href="/account/password">Cambio password</a>

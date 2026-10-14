@@ -21,6 +21,7 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    ad_free_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -33,6 +34,7 @@ class User(Base):
         cascade="save-update",
         foreign_keys=lambda: [UserRegistrationRequest.reviewed_by_user_id],
     )
+    payments: Mapped[list["Payment"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class UserRegistrationRequest(Base):
@@ -120,6 +122,32 @@ class Route(Base):
 
     user: Mapped["User"] = relationship(back_populates="routes")
     connection: Mapped["AuthConnection"] = relationship(back_populates="routes")
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    __table_args__ = (UniqueConstraint("provider", "external_id", name="uq_payments_provider_external"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    account_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    purpose: Mapped[str] = mapped_column(String(64), nullable=False, default="premium_ad_free")
+    amount_cents: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str | None] = mapped_column(String(8))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    premium_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consent_version: Mapped[str | None] = mapped_column(String(32))
+    raw_payload: Mapped[dict | list | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="payments")
 
 
 class AuditLog(Base):
