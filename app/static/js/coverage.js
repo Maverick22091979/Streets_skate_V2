@@ -3,6 +3,8 @@
   const fit = document.getElementById('fitCoverage');
   const reload = document.getElementById('reloadCoverage');
   const show = document.getElementById('showCoverage');
+  const locateBtn = document.getElementById('locateCoverage');
+  const locationStatus = document.getElementById('coverageLocationStatus');
   if (!window.L) {
     status.textContent = 'Mappa non disponibile. Ricarica la pagina per riprovare.';
     reload.disabled = true;
@@ -17,6 +19,9 @@
   const stops = [[37, 99, 235], [6, 182, 212], [34, 197, 94], [250, 204, 21], [220, 38, 38]];
   let layer;
   let drawing;
+  let marker;
+  let locating = false;
+  let viewChosen = false;
 
   function color(p) {
     const x = Math.max(0, Math.min(100, p)) / 25;
@@ -27,7 +32,38 @@
   function frame() {
     if (layer && layer.getBounds().isValid()) {
       map.fitBounds(layer.getBounds(), { padding: [24, 24], maxZoom: 16 });
+      viewChosen = true;
     }
+  }
+
+  function locate() {
+    if (locating) return;
+    const geo = window.navigator?.geolocation;
+    if (!geo || window.isSecureContext === false) {
+      locationStatus.textContent = 'Posizione non disponibile: usa HTTPS oppure localhost e un browser con geolocalizzazione.';
+      return;
+    }
+    locating = true;
+    locateBtn.disabled = true;
+    locationStatus.textContent = 'Consenti l’accesso alla posizione per centrare la mappa sul dispositivo.';
+    geo.getCurrentPosition((pos) => {
+      locating = false;
+      locateBtn.disabled = false;
+      const point = [pos.coords.latitude, pos.coords.longitude];
+      if (marker) map.removeLayer(marker);
+      marker = L.circleMarker(point, { radius: 7, color: '#fff', weight: 2, fillColor: '#2563eb', fillOpacity: 1 })
+        .addTo(map).bindPopup('Posizione del dispositivo');
+      viewChosen = true;
+      map.setView(point, 15);
+      locationStatus.textContent = 'Mappa centrata sulla posizione del dispositivo.';
+    }, (err) => {
+      locating = false;
+      locateBtn.disabled = false;
+      locationStatus.textContent = err.code === 1
+        ? 'Accesso alla posizione negato. Puoi esplorare la mappa manualmente o abilitare il permesso nel browser.'
+        : 'Impossibile rilevare la posizione. Puoi esplorare la mappa o riprovare con La mia posizione.';
+      if (!viewChosen) frame();
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 });
   }
 
   const pause = () => new Promise((resolve) => window.setTimeout(resolve, 0));
@@ -66,7 +102,7 @@
       layer = target;
       if (show.checked && !map.hasLayer(layer)) layer.addTo(map);
       fit.disabled = !layer.getBounds().isValid();
-      if (!framed && !fit.disabled) {
+      if (!framed && !fit.disabled && !locating && !viewChosen) {
         frame();
         framed = true;
       }
@@ -109,7 +145,9 @@
         onEachFeature: (f, line) => {
           const p = f.properties.percentage;
           const pct = p < 0.01 ? '<0,01' : p.toLocaleString('it-IT', { maximumFractionDigits: 2 });
-          line.bindPopup(`${pct}% · ${f.properties.count} pattinate su ${data.total_routes}`);
+          const text = `${pct}% · ${f.properties.count} pattinate su ${data.total_routes}`;
+          line.bindTooltip(text, { sticky: true, direction: 'top', offset: [0, -10] });
+          line.bindPopup(text);
         },
       });
       drawing = next;
@@ -138,6 +176,7 @@
   }
 
   fit.addEventListener('click', frame);
+  locateBtn.addEventListener('click', locate);
   reload.addEventListener('click', load);
   show.addEventListener('change', () => {
     for (const target of [layer, drawing]) {
@@ -146,5 +185,6 @@
       else if (!show.checked) map.removeLayer(target);
     }
   });
+  locate();
   load();
 })();

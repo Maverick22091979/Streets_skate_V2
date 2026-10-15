@@ -23,22 +23,25 @@ async function until(fn) {
   assert.fail('Expected async state was not reached');
 }
 
-function setup(pending, fail = false) {
+function setup(pending, fail = false, geo) {
   const els = new Map();
   const layers = new Set();
   const timers = [];
   const urls = [];
   let releases = 0;
   let calls = 0;
+  const views = [];
+  let frames = 0;
   const map = {
-    setView() { return this; },
-    fitBounds() {},
+    setView(point, zoom) { views.push({ point: [...point], zoom }); return this; },
+    fitBounds() { frames += 1; },
     removeLayer(layer) { layers.delete(layer); },
     hasLayer(layer) { return layers.has(layer); },
   };
   const L = {
     map: () => map,
     tileLayer: () => ({ addTo() {} }),
+    circleMarker: () => ({ addTo() { return this; }, bindPopup() { return this; } }),
     geoJSON: (_, opts) => ({
       opts, features: [],
       addData(f) { this.features.push(f); },
@@ -54,6 +57,7 @@ function setup(pending, fail = false) {
   };
   const win = {
     L, location: { assign() {} },
+    navigator: { geolocation: geo },
     sessionGuard: { beginTask: () => () => { releases += 1; } },
     setTimeout(fn, ms) {
       if (ms === 0) setImmediate(fn);
@@ -71,7 +75,7 @@ function setup(pending, fail = false) {
     return { ok: true, status: 200, json: async () => ready };
   }
   vm.runInNewContext(src, { window: win, document, L, fetch, AbortController });
-  return { els, layers, timers, urls, get releases() { return releases; } };
+  return { els, layers, timers, urls, views, get frames() { return frames; }, get releases() { return releases; } };
 }
 
 test('database tracks are visible while frequencies are still processing', async () => {
@@ -103,4 +107,34 @@ test('calculation failure keeps database tracks usable and releases the session 
   assert.equal(env.layers.size, 1);
   assert.equal(env.els.get('reloadCoverage').disabled, false);
   assert.ok(env.els.get('coverageStatus').textContent.includes('restano esplorabili'));
+});
+
+test('device position remains the map center after frequencies finish loading', async () => {
+  let success;
+  const env = setup(false, false, { getCurrentPosition(fn) { success = fn; } });
+  await until(() => env.releases === 1);
+  assert.equal(env.frames, 0);
+  success({ coords: { latitude: 41.9, longitude: 12.5 } });
+  assert.deepEqual(env.views.at(-1), { point: [41.9, 12.5], zoom: 15 });
+  assert.equal(env.els.get('locateCoverage').disabled, false);
+  assert.ok(env.els.get('coverageLocationStatus').textContent.includes('centrata'));
+});
+
+test('an early location result is not replaced by automatic route framing', async () => {
+  const env = setup(false, false, {
+    getCurrentPosition(success) { success({ coords: { latitude: 41.9, longitude: 12.5 } }); },
+  });
+  await until(() => env.releases === 1);
+  assert.equal(env.frames, 0);
+  assert.deepEqual(env.views.at(-1), { point: [41.9, 12.5], zoom: 15 });
+});
+
+test('denied location permission falls back to the loaded routes', async () => {
+  let deny;
+  const env = setup(false, false, { getCurrentPosition(_, fn) { deny = fn; } });
+  await until(() => env.releases === 1);
+  deny({ code: 1 });
+  assert.equal(env.frames, 1);
+  assert.equal(env.els.get('locateCoverage').disabled, false);
+  assert.ok(env.els.get('coverageLocationStatus').textContent.includes('negato'));
 });

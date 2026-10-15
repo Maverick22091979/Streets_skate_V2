@@ -767,6 +767,30 @@ async function saveProviderButtonSettings() {
   }
 }
 
+async function readImportResponse(response) {
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    const reasons = {
+      413: 'File troppo grandi per il proxy: verifica client_max_body_size in nginx.',
+      502: 'Il proxy non riesce a raggiungere il servizio web.',
+      503: 'Il servizio web non è disponibile.',
+      504: 'Timeout del proxy durante l’import.',
+      522: 'Timeout di connessione al server di produzione.',
+      524: 'Timeout Cloudflare durante l’import.',
+    };
+    if (response.redirected) throw new Error('Sessione scaduta: accedi nuovamente e riprova.');
+    throw new Error(`HTTP ${response.status}: ${reasons[response.status] || 'Il server ha restituito una pagina HTML o una risposta non valida. Controlla i log di nginx e del servizio web.'}`);
+  }
+  if (!response.ok) {
+    const detail = data.detail || data.error || 'Errore import GPX';
+    throw new Error(`HTTP ${response.status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
+  }
+  return data;
+}
+
 async function uploadGpx(ev) {
   if (ev) ev.preventDefault();
   const files = [...(gpxFiles?.files || [])];
@@ -785,12 +809,20 @@ async function uploadGpx(ev) {
   });
   const groups = [...bundles.values()].filter((group) => group.some((file) => /\.gpx$/i.test(file.name)));
   if (!groups.length) {
-    statusText.textContent = 'Errore: seleziona almeno un GPX, con il JSON opzionale omonimo';
-    if (gpxUploadState) gpxUploadState.textContent = 'Nessun bundle GPX valido selezionato';
+    const message = 'Nessun file GPX selezionato. Per l’export adidas apri Sport-sessions/GPS-data e seleziona i .gpx, con i .json omonimi opzionali. I JSON nella cartella Sport-sessions sono i dati descrittivi delle attività.';
+    statusText.textContent = `Errore: ${message}`;
+    if (gpxUploadState) gpxUploadState.textContent = message;
     return;
   }
+  const large = groups.find((group) => group.reduce((sum, file) => sum + file.size, 0) > 20 * 1024 * 1024);
+  if (large) {
+    const message = `Il percorso ${large[0].name} con i relativi file supera 20 MB. Carica un GPX più piccolo oppure seleziona il solo GPX senza il JSON opzionale.`;
+    statusText.textContent = message;
+    if (gpxUploadState) gpxUploadState.textContent = message;
+    return;
+  }
+  const end = window.sessionGuard?.beginTask() || (() => {});
   uploadGpxBtn.disabled = true;
-  let lastRoutes = [];
   let totalCached = 0;
   let imported = 0;
   let skippedFilename = 0;
@@ -800,7 +832,7 @@ async function uploadGpx(ev) {
   let skippedWrongTypeNames = [];
   let processedBundles = 0;
   const batches = [];
-  for (let index = 0; index < groups.length; index += 5) batches.push(groups.slice(index, index + 5));
+  for (const group of groups) batches.push([group]);
   statusText.textContent = `Import in corso: 0/${groups.length} percorsi`;
   if (gpxUploadState) gpxUploadState.textContent = `Preparazione di ${groups.length} bundle GPX/JSON...`;
   setGpxProgress(0, groups.length, `0 / ${groups.length} percorsi`);
@@ -811,9 +843,16 @@ async function uploadGpx(ev) {
       batch.flat().forEach((file) => fd.append('files', file));
       statusText.textContent = `Import in corso: ${processedBundles}/${groups.length} percorsi`;
       if (gpxUploadState) gpxUploadState.textContent = `Elaborazione percorsi ${processedBundles + 1}-${processedBundles + batch.length} di ${groups.length}`;
-      const response = await fetch('/api/manual-import/gpx', { method: 'POST', headers: csrfHeaders(), body: fd });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || 'Errore import GPX');
+      const response = await fetch('/api/manual-import/gpx/start', { method: 'POST', headers: csrfHeaders(), body: fd });
+      const start = await readImportResponse(response);
+      if (!start.job_id) throw new Error('Il server non ha restituito un identificativo di import valido.');
+      let job;
+      do {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        job = await readImportResponse(await fetch(`/api/manual-import/jobs/${encodeURIComponent(start.job_id)}`, { cache: 'no-store' }));
+      } while (job.status === 'running');
+      if (job.status !== 'done' || !job.result) throw new Error(job.error || 'Import non completato: verifica i percorsi già salvati.');
+      const data = job.result;
       imported += Number(data.imported || 0);
       skippedFilename += Number(data.skipped_filename || 0);
       skippedShort += Number(data.skipped_short || 0);
@@ -821,12 +860,10 @@ async function uploadGpx(ev) {
       skippedShortNames = skippedShortNames.concat(data.skipped_short_names || []);
       skippedWrongTypeNames = skippedWrongTypeNames.concat(data.skipped_wrong_type_names || []);
       totalCached = Number(data.total_cached || totalCached);
-      lastRoutes = data.routes || lastRoutes;
       processedBundles += batch.length;
       setGpxProgress(processedBundles, groups.length, `${processedBundles} / ${groups.length} percorsi`);
     }
-    allRoutes = lastRoutes;
-    renderRoutes(allRoutes);
+    await loadRoutes();
     const shortMsg = shortSkipMessage(skippedShort, skippedShortNames);
     const wrongTypeMsg = wrongTypeSkipMessage(skippedWrongType, skippedWrongTypeNames);
     const bundleMsg = `${processedBundles} bundle GPX/JSON`;
@@ -834,9 +871,11 @@ async function uploadGpx(ev) {
     if (gpxUploadState) gpxUploadState.textContent = `Import completato: ${imported} percorsi da ${bundleMsg}, scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}, totale cache ${totalCached}`;
     gpxUploadForm.reset();
   } catch (err) {
+    if (processedBundles > 0) await loadRoutes();
     statusText.textContent = `Errore: ${err.message}`;
     if (gpxUploadState) gpxUploadState.textContent = `Errore import GPX: ${err.message}`;
   } finally {
+    end();
     uploadGpxBtn.disabled = false;
     setTimeout(() => resetGpxProgress(), 1200);
   }

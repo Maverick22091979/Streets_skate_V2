@@ -146,6 +146,9 @@ PROVIDER_BUTTON_SETTINGS: dict[str, dict[str, bool]] = {
     for key in PROVIDERS
 }
 IMPORT_JOBS: dict[str, dict[str, Any]] = {}
+GPX_IMPORT_JOBS: dict[str, dict[str, Any]] = {}
+GPX_IMPORT_TASKS: set[asyncio.Task] = set()
+GPX_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 FAILED_ADMIN_LOGINS: dict[str, dict[str, Any]] = {}
 IP_GEO_CACHE: dict[str, dict[str, Any]] = {}
 ALLOWED_GPX_SPORT_TYPES = {
@@ -248,6 +251,8 @@ def startup() -> None:
 async def apply_security_headers(request: Request, call_next):
     response = await call_next(request)
     for key, value in SECURITY_HEADERS.items():
+        if key == "Permissions-Policy" and request.url.path == "/coverage":
+            value = value.replace("geolocation=()", "geolocation=(self)")
         response.headers.setdefault(key, value)
     if SECURITY_ENABLE_HSTS:
         response.headers.setdefault("Strict-Transport-Security", f"max-age={SECURITY_HSTS_MAX_AGE}; includeSubDomains")
@@ -2357,7 +2362,7 @@ async def _enrich_route_data(db: Session, norm: dict[str, Any]) -> dict[str, Any
     return norm
 
 
-def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dict[str, Any]]) -> list[Route]:
+def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dict[str, Any]], load_routes: bool = True) -> list[Route]:
     ext_ids = [item["external_id"] for item in items]
     existing = {}
     if ext_ids:
@@ -2401,6 +2406,8 @@ def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dic
         saved.append(route)
     db.commit()
     _coverage_cache.warm()
+    if not load_routes:
+        return []
     stmt = select(Route).where(Route.user_id == user.id).order_by(Route.start_date_local.desc().nullslast(), Route.id.desc())
     return list(db.execute(stmt).scalars())
 
@@ -3967,29 +3974,34 @@ def api_import_job_status(job_id: str):
     return JSONResponse(job)
 
 
-@app.post("/api/manual-import/gpx")
-async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
-    _require_csrf(request, csrf_token)
-    if not _is_admin(request):
-        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
-    user, conn = _get_or_create_admin_entities(db)
-    imported_items: list[dict[str, Any]] = []
-    skipped_filename = 0
-    skipped_short = 0
-    skipped_wrong_type = 0
-    skipped_short_names: list[str] = []
-    skipped_wrong_type_names: list[str] = []
-    stored_filenames = _stored_route_filenames(db)
-    bundles: dict[str, dict[str, tuple[str, bytes]]] = {}
+async def _read_gpx_bundles(files):
+    bundles = {}
+    size = 0
     for f in files:
         if not f.filename:
             continue
-        filename = f.filename
+        filename = Path(f.filename).name
         ext = Path(filename).suffix.lower()
         if ext not in {".gpx", ".json"}:
             continue
-        stem = Path(filename).stem
-        bundles.setdefault(stem, {})[ext] = (filename, await f.read())
+        raw = await f.read(GPX_UPLOAD_MAX_BYTES - size + 1)
+        size += len(raw)
+        if size > GPX_UPLOAD_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Caricamento oltre 20 MB: seleziona meno percorsi per volta")
+        bundles.setdefault(Path(filename).stem, {})[ext] = (filename, raw)
+    bundles = {key: value for key, value in bundles.items() if ".gpx" in value}
+    if not bundles:
+        raise HTTPException(status_code=400, detail="Seleziona almeno un file GPX; i JSON omonimi sono opzionali")
+    return bundles
+
+
+async def _import_gpx_bundles(request, db, bundles, files_received, include_routes=True):
+    user, conn = _get_or_create_admin_entities(db)
+    imported_items = []
+    skipped_filename = skipped_short = skipped_wrong_type = 0
+    skipped_short_names = []
+    skipped_wrong_type_names = []
+    stored_filenames = _stored_route_filenames(db)
     processed_bundles = 0
     for bundle in bundles.values():
         if ".gpx" not in bundle:
@@ -4016,38 +4028,94 @@ async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: l
         norm["external_id"] = f'gpx:{gpx_name}:{int(datetime.now(UTC).timestamp())}:{len(imported_items)}'
         imported_items.append(norm)
         stored_filenames.add(filename_key)
-    routes = _store_routes(db, user, conn, imported_items)
-    request.session["session_last_seen_at"] = time.time()
-    _write_audit_log(
+    routes = _store_routes(db, user, conn, imported_items, load_routes=include_routes)
+    total_cached = len(routes) if include_routes else db.scalar(select(func.count(Route.id)).where(Route.user_id == user.id))
+    actor = request.session.get("local_admin") or {}
+    _write_audit_log_for_actor(
         db,
-        request,
         "import_gpx",
+        "Admin",
+        actor.get("label") or "Admin locale",
+        actor.get("username"),
+        request=request,
         meta={
-            "files_received": len(files),
+            "files_received": files_received,
             "processed_bundles": processed_bundles,
             "imported": len(imported_items),
             "skipped_filename": skipped_filename,
             "skipped_short": skipped_short,
             "skipped_wrong_type": skipped_wrong_type,
             "skipped_wrong_type_names": skipped_wrong_type_names[:10],
-            "total_cached": len(routes),
+            "total_cached": total_cached,
         },
     )
-    return JSONResponse(
+    return (
         {
             "imported": len(imported_items),
-            "files_received": len(files),
+            "files_received": files_received,
             "processed_bundles": processed_bundles,
             "skipped_filename": skipped_filename,
             "skipped_short": skipped_short,
             "skipped_short_names": skipped_short_names,
             "skipped_wrong_type": skipped_wrong_type,
             "skipped_wrong_type_names": skipped_wrong_type_names,
-            "total_cached": len(routes),
+            "total_cached": total_cached,
             "provider": "manual",
-            "routes": [_serialize_route(r) for r in routes],
+            "routes": [_serialize_route(r) for r in routes] if include_routes else None,
         }
     )
+
+
+@app.post("/api/manual-import/gpx")
+async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
+    _require_csrf(request, csrf_token)
+    if not _is_admin(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    bundles = await _read_gpx_bundles(files)
+    data = await _import_gpx_bundles(request, db, bundles, len(files))
+    request.session["session_last_seen_at"] = time.time()
+    return JSONResponse(data)
+
+
+async def _run_gpx_import_job(job_id, request, bundles, files_received):
+    with SessionLocal() as db:
+        try:
+            data = await _import_gpx_bundles(request, db, bundles, files_received, include_routes=False)
+            GPX_IMPORT_JOBS[job_id].update(status="done", result=data)
+        except Exception as exc:
+            db.rollback()
+            GPX_IMPORT_JOBS[job_id].update(status="error", error=str(exc))
+
+
+@app.post("/api/manual-import/gpx/start")
+async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...)):
+    _require_csrf(request, csrf_token)
+    if not _is_admin(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    bundles = await _read_gpx_bundles(files)
+    now = time.time()
+    for key, job in list(GPX_IMPORT_JOBS.items()):
+        if job["status"] != "running" and now - job["created_at"] > 3600:
+            GPX_IMPORT_JOBS.pop(key, None)
+    job_id = uuid.uuid4().hex
+    GPX_IMPORT_JOBS[job_id] = {
+        "job_id": job_id, "status": "running", "result": None, "error": None,
+        "created_at": now, "_owner": request.session.get("csrf_token"),
+    }
+    task = asyncio.create_task(_run_gpx_import_job(job_id, request, bundles, len(files)))
+    GPX_IMPORT_TASKS.add(task)
+    task.add_done_callback(GPX_IMPORT_TASKS.discard)
+    return JSONResponse({"job_id": job_id, "status": "running"}, status_code=202)
+
+
+@app.get("/api/manual-import/jobs/{job_id}")
+def api_gpx_import_status(job_id: str, request: Request):
+    if not _is_admin(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    job = GPX_IMPORT_JOBS.get(job_id)
+    if not job or job["_owner"] != request.session.get("csrf_token"):
+        raise HTTPException(status_code=404, detail="Import non trovato per questa sessione; verifica i percorsi già salvati e riprova i file mancanti")
+    return JSONResponse({key: value for key, value in job.items() if not key.startswith("_")}, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/dashboard/import-gpx")

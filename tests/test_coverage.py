@@ -121,6 +121,8 @@ class CoverageApiTests(unittest.TestCase):
             res = self.client.get("/coverage")
             self.assertEqual(res.status_code, 200)
             self.assertIn('id="coverageMap"', res.text)
+            self.assertIn('geolocation=(self)', res.headers['permissions-policy'])
+            self.assertIn('geolocation=()', self.client.get('/').headers['permissions-policy'])
             self.assertLess(res.text.index('/static/js/session-guard.js'), res.text.index('/static/js/coverage.js'))
             res = self.client.get("/api/coverage")
             self.assertEqual(res.status_code, 200)

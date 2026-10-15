@@ -26,16 +26,18 @@
       <section class="coverage-panel" aria-label="Frequenza dei passaggi">
         <div class="toolbar coverage-toolbar">
           <button id="fitCoverage" type="button" disabled>Inquadra tutti i percorsi</button>
+          <button id="locateCoverage" type="button">La mia posizione</button>
           <button id="reloadCoverage" type="button">Aggiorna</button>
           <label><input id="showCoverage" type="checkbox" checked> Mostra passaggi</label>
         </div>
         <p id="coverageStatus" role="status" aria-live="polite">Caricamento dei percorsi dal database…</p>
+        <p id="coverageLocationStatus" role="status" aria-live="polite"></p>
         <div id="coverageMap" aria-label="Mappa interattiva dei passaggi" tabindex="0"></div>
         <div class="coverage-legend" aria-label="Legenda frequenze">
           <strong>Pattinate che attraversano il tratto / totale pattinate</strong>
           <div class="coverage-gradient" aria-hidden="true"></div>
           <div class="coverage-ticks"><span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
-          <p>Dal blu (passaggi rari) al rosso (tutte le pattinate). Tocca un tratto per leggere percentuale e numero di pattinate.</p>
+          <p>Dal blu (passaggi rari) al rosso (tutte le pattinate). Passa con il mouse su un tratto oppure toccalo per leggere percentuale e numero di pattinate.</p>
           <p>Durante il primo calcolo i percorsi già presenti nel database appaiono in grigio e la mappa è subito esplorabile. Le frequenze salvate vengono riutilizzate finché l'archivio non cambia.</p>
           <p><strong>Senza colore: nessun passaggio registrato.</strong> Esplora la mappa per individuare le zone da percorrere; puoi nascondere i passaggi per leggere meglio le strade.</p>
           <p id="coverageMethod">Ogni pattinata conta una sola volta per tratto, in entrambi i sensi. Le frequenze sono stime basate sulle tracce GPS, senza aggancio alla rete stradale.</p>
