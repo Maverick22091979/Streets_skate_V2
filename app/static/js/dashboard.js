@@ -791,8 +791,46 @@ async function readImportResponse(response) {
   return data;
 }
 
+function gpxBatches(groups, maxCount = 5, maxBytes = 4 * 1024 * 1024) {
+  const batches = [];
+  let batch = [];
+  let size = 0;
+  for (const group of groups) {
+    const bytes = group.reduce((sum, file) => sum + file.size, 0);
+    if (batch.length && (batch.length >= maxCount || size + bytes > maxBytes)) {
+      batches.push(batch);
+      batch = [];
+      size = 0;
+    }
+    batch.push(group);
+    size += bytes;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+async function gpxJobStatus(id) {
+  for (let attempt = 0; ; attempt += 1) {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 30000);
+    try {
+      const response = await fetch(`/api/manual-import/jobs/${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctrl.signal });
+      if ([502, 503, 504, 522, 524].includes(response.status)) {
+        throw Object.assign(new Error(`HTTP ${response.status}: stato import temporaneamente non disponibile`), { retryable: true });
+      }
+      return await readImportResponse(response);
+    } catch (err) {
+      if (attempt >= 3 || !(err.retryable || err.name === 'TypeError' || err.name === 'AbortError')) throw err;
+      await new Promise((resolve) => window.setTimeout(resolve, 2000 * (attempt + 1)));
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+}
+
 async function uploadGpx(ev) {
   if (ev) ev.preventDefault();
+  if (uploadGpxBtn.disabled) return;
   const files = [...(gpxFiles?.files || [])];
   if (!files.length) {
     statusText.textContent = 'Errore: seleziona almeno un file GPX o JSON';
@@ -831,8 +869,7 @@ async function uploadGpx(ev) {
   let skippedShortNames = [];
   let skippedWrongTypeNames = [];
   let processedBundles = 0;
-  const batches = [];
-  for (const group of groups) batches.push([group]);
+  const batches = gpxBatches(groups);
   statusText.textContent = `Import in corso: 0/${groups.length} percorsi`;
   if (gpxUploadState) gpxUploadState.textContent = `Preparazione di ${groups.length} bundle GPX/JSON...`;
   setGpxProgress(0, groups.length, `0 / ${groups.length} percorsi`);
@@ -849,7 +886,14 @@ async function uploadGpx(ev) {
       let job;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        job = await readImportResponse(await fetch(`/api/manual-import/jobs/${encodeURIComponent(start.job_id)}`, { cache: 'no-store' }));
+        job = await gpxJobStatus(start.job_id);
+        const done = processedBundles + Math.min(batch.length, Number(job.done || 0));
+        setGpxProgress(done, groups.length, `${done} / ${groups.length} percorsi`);
+        if (gpxUploadState && job.status === 'running') {
+          gpxUploadState.textContent = job.phase === 'queued'
+            ? `Blocco in attesa di elaborazione: ${done}/${groups.length} percorsi`
+            : `Elaborazione ${done}/${groups.length}: ${job.current || 'salvataggio in corso'}`;
+        }
       } while (job.status === 'running');
       if (job.status !== 'done' || !job.result) throw new Error(job.error || 'Import non completato: verifica i percorsi già salvati.');
       const data = job.result;
@@ -873,7 +917,7 @@ async function uploadGpx(ev) {
   } catch (err) {
     if (processedBundles > 0) await loadRoutes();
     statusText.textContent = `Errore: ${err.message}`;
-    if (gpxUploadState) gpxUploadState.textContent = `Errore import GPX: ${err.message}`;
+    if (gpxUploadState) gpxUploadState.textContent = `Errore import GPX: ${err.message}. I percorsi già salvati restano disponibili; puoi riprovare la stessa selezione.`;
   } finally {
     end();
     uploadGpxBtn.disabled = false;

@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,7 @@ PROVIDER_BUTTON_SETTINGS: dict[str, dict[str, bool]] = {
 IMPORT_JOBS: dict[str, dict[str, Any]] = {}
 GPX_IMPORT_JOBS: dict[str, dict[str, Any]] = {}
 GPX_IMPORT_TASKS: set[asyncio.Task] = set()
+GPX_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpx-import")
 GPX_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 FAILED_ADMIN_LOGINS: dict[str, dict[str, Any]] = {}
 IP_GEO_CACHE: dict[str, dict[str, Any]] = {}
@@ -2311,7 +2313,7 @@ def _normalize_for_storage(provider: str, raw: dict[str, Any]) -> dict[str, Any]
     }
 
 
-async def _enrich_route_data(db: Session, norm: dict[str, Any]) -> dict[str, Any]:
+async def _enrich_route_data(db: Session | None, norm: dict[str, Any]) -> dict[str, Any]:
     enrichment = norm.get("enrichment") or _local_enrichment_placeholder()
     norm["enrichment"] = enrichment
     profile_points = (enrichment.get("point_profile") or {}).get("points") or []
@@ -2357,12 +2359,13 @@ async def _enrich_route_data(db: Session, norm: dict[str, Any]) -> dict[str, Any
             enrichment["weather_source"] = enrichment.get("weather_source") or "open-meteo_unavailable"
     seg_idx = _route_segment_speed_index(profile_points)
     enrichment["segment_speed_index"] = seg_idx
-    enrichment["segment_max_speed_kmh"] = _historical_segment_max_speed(db, seg_idx)
+    if db is not None:
+        enrichment["segment_max_speed_kmh"] = _historical_segment_max_speed(db, seg_idx)
     norm["difficulty"] = _skate_difficulty(norm["distance_m"], norm["elevation_gain_m"], enrichment)
     return norm
 
 
-def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dict[str, Any]], load_routes: bool = True) -> list[Route]:
+def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dict[str, Any]], load_routes: bool = True, warm_coverage: bool = True) -> list[Route]:
     ext_ids = [item["external_id"] for item in items]
     existing = {}
     if ext_ids:
@@ -2405,7 +2408,8 @@ def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dic
         route.raw_payload = item["raw_payload"]
         saved.append(route)
     db.commit()
-    _coverage_cache.warm()
+    if warm_coverage:
+        _coverage_cache.warm()
     if not load_routes:
         return []
     stmt = select(Route).where(Route.user_id == user.id).order_by(Route.start_date_local.desc().nullslast(), Route.id.desc())
@@ -2501,12 +2505,9 @@ def _route_segment_speed_index(points: list[dict[str, Any]]) -> dict[str, float]
 def _historical_segment_max_speed(db: Session, segment_index: dict[str, float]) -> float | None:
     if not segment_index:
         return None
-    stmt = select(Route.enrichment)
+    stmt = select(Route.enrichment["segment_speed_index"])
     hist = 0.0
-    for enrichment in db.execute(stmt).scalars():
-        if not isinstance(enrichment, dict):
-            continue
-        idx = enrichment.get("segment_speed_index") or {}
+    for idx in db.execute(stmt).scalars():
         if not isinstance(idx, dict):
             continue
         for sig in segment_index:
@@ -2574,10 +2575,8 @@ def _find_manual_duplicate(db: Session, user: User, filename: str, candidate: di
 
 def _stored_route_filenames(db: Session) -> set[str]:
     names: set[str] = set()
-    for raw in db.execute(select(Route.raw_payload)).scalars():
-        if not isinstance(raw, dict):
-            continue
-        filename = Path(str(raw.get("filename") or "")).name.casefold().strip()
+    for raw in db.execute(select(Route.raw_payload["filename"].as_string())).scalars():
+        filename = Path(str(raw or "")).name.casefold().strip()
         if filename:
             names.add(filename)
     return names
@@ -3995,19 +3994,21 @@ async def _read_gpx_bundles(files):
     return bundles
 
 
-async def _import_gpx_bundles(request, db, bundles, files_received, include_routes=True):
-    user, conn = _get_or_create_admin_entities(db)
-    imported_items = []
+async def _import_gpx_bundles(request, db, bundles, files_received, include_routes=True, progress=None):
+    imported = 0
     skipped_filename = skipped_short = skipped_wrong_type = 0
     skipped_short_names = []
     skipped_wrong_type_names = []
     stored_filenames = _stored_route_filenames(db)
+    db.close()
     processed_bundles = 0
     for bundle in bundles.values():
         if ".gpx" not in bundle:
             continue
         processed_bundles += 1
         gpx_name, gpx_raw = bundle[".gpx"]
+        if progress is not None:
+            progress.update(done=processed_bundles - 1, imported=imported, current=gpx_name, phase="processing")
         filename_key = Path(gpx_name).name.casefold().strip()
         if filename_key in stored_filenames:
             skipped_filename += 1
@@ -4024,11 +4025,19 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
             skipped_short_names.append(parsed.get("name") or gpx_name)
             continue
         norm = _normalize_for_storage("manual", parsed)
-        norm = await _enrich_route_data(db, norm)
-        norm["external_id"] = f'gpx:{gpx_name}:{int(datetime.now(UTC).timestamp())}:{len(imported_items)}'
-        imported_items.append(norm)
+        norm = await _enrich_route_data(None, norm)
+        norm["external_id"] = f"gpx:{uuid.uuid4().hex}"
+        try:
+            user, conn = _get_or_create_admin_entities(db)
+            enrichment = norm["enrichment"]
+            enrichment["segment_max_speed_kmh"] = _historical_segment_max_speed(db, enrichment.get("segment_speed_index") or {})
+            _store_routes(db, user, conn, [norm], load_routes=False, warm_coverage=False)
+        finally:
+            db.close()
+        imported += 1
         stored_filenames.add(filename_key)
-    routes = _store_routes(db, user, conn, imported_items, load_routes=include_routes)
+    user, conn = _get_or_create_admin_entities(db)
+    routes = _user_routes(db, user.id) if include_routes else []
     total_cached = len(routes) if include_routes else db.scalar(select(func.count(Route.id)).where(Route.user_id == user.id))
     actor = request.session.get("local_admin") or {}
     _write_audit_log_for_actor(
@@ -4041,7 +4050,7 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
         meta={
             "files_received": files_received,
             "processed_bundles": processed_bundles,
-            "imported": len(imported_items),
+            "imported": imported,
             "skipped_filename": skipped_filename,
             "skipped_short": skipped_short,
             "skipped_wrong_type": skipped_wrong_type,
@@ -4051,7 +4060,7 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
     )
     return (
         {
-            "imported": len(imported_items),
+            "imported": imported,
             "files_received": files_received,
             "processed_bundles": processed_bundles,
             "skipped_filename": skipped_filename,
@@ -4067,24 +4076,35 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
 
 
 @app.post("/api/manual-import/gpx")
-async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...)):
     _require_csrf(request, csrf_token)
     if not _is_admin(request):
         raise HTTPException(status_code=403, detail="Accesso admin richiesto")
     bundles = await _read_gpx_bundles(files)
-    data = await _import_gpx_bundles(request, db, bundles, len(files))
+    data = await asyncio.get_running_loop().run_in_executor(
+        GPX_IMPORT_POOL, _process_gpx_import, request, bundles, len(files), True, None,
+    )
     request.session["session_last_seen_at"] = time.time()
     return JSONResponse(data)
 
 
+def _process_gpx_import(request, bundles, files_received, include_routes=False, progress=None):
+    try:
+        with SessionLocal() as db:
+            return asyncio.run(_import_gpx_bundles(request, db, bundles, files_received, include_routes, progress))
+    finally:
+        _coverage_cache.warm()
+
+
 async def _run_gpx_import_job(job_id, request, bundles, files_received):
-    with SessionLocal() as db:
-        try:
-            data = await _import_gpx_bundles(request, db, bundles, files_received, include_routes=False)
-            GPX_IMPORT_JOBS[job_id].update(status="done", result=data)
-        except Exception as exc:
-            db.rollback()
-            GPX_IMPORT_JOBS[job_id].update(status="error", error=str(exc))
+    job = GPX_IMPORT_JOBS[job_id]
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(
+            GPX_IMPORT_POOL, _process_gpx_import, request, bundles, files_received, False, job,
+        )
+        job.update(status="done", result=data, done=len(bundles), imported=data["imported"], current=None)
+    except Exception as exc:
+        job.update(status="error", error=str(exc))
 
 
 @app.post("/api/manual-import/gpx/start")
@@ -4093,6 +4113,8 @@ async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), fi
     if not _is_admin(request):
         raise HTTPException(status_code=403, detail="Accesso admin richiesto")
     bundles = await _read_gpx_bundles(files)
+    if sum(job["status"] == "running" for job in GPX_IMPORT_JOBS.values()) >= 8:
+        raise HTTPException(status_code=429, detail="Coda import piena: attendi il completamento dei caricamenti in corso")
     now = time.time()
     for key, job in list(GPX_IMPORT_JOBS.items()):
         if job["status"] != "running" and now - job["created_at"] > 3600:
@@ -4101,6 +4123,7 @@ async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), fi
     GPX_IMPORT_JOBS[job_id] = {
         "job_id": job_id, "status": "running", "result": None, "error": None,
         "created_at": now, "_owner": request.session.get("csrf_token"),
+        "done": 0, "total": len(bundles), "imported": 0, "current": None, "phase": "queued",
     }
     task = asyncio.create_task(_run_gpx_import_job(job_id, request, bundles, len(files)))
     GPX_IMPORT_TASKS.add(task)
@@ -4119,12 +4142,12 @@ def api_gpx_import_status(job_id: str, request: Request):
 
 
 @app.post("/dashboard/import-gpx")
-async def dashboard_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def dashboard_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...)):
     _require_csrf(request, csrf_token)
     if not _is_admin(request):
         return RedirectResponse(f"/dashboard?gpx_status={quote('Accesso admin richiesto')}", status_code=303)
     try:
-        payload = await api_import_gpx(request, csrf_token=csrf_token, files=files, db=db)
+        payload = await api_import_gpx(request, csrf_token=csrf_token, files=files)
         data = payload.body.decode("utf-8")
         body = json.loads(data)
         short_names = body.get("skipped_short_names", [])

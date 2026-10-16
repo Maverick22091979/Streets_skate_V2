@@ -3,13 +3,14 @@ import base64
 import io
 import json
 import time
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException, UploadFile
 import httpx
 from itsdangerous import TimestampSigner
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
@@ -42,17 +43,18 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
         GPX_IMPORT_JOBS.clear()
 
     async def test_upload_returns_before_enrichment_finishes_and_polls_to_completion(self):
-        gate = asyncio.Event()
+        gate = threading.Event()
 
         async def work(*args, **kwargs):
-            await gate.wait()
+            if not gate.wait(5):
+                raise TimeoutError("worker non sbloccato")
             return {"imported": 1, "routes": None}
 
         factory = Mock()
         factory.return_value.__enter__ = Mock(return_value=Mock())
         factory.return_value.__exit__ = Mock(return_value=False)
         req = request()
-        with patch("app.main.SessionLocal", factory), patch("app.main._import_gpx_bundles", side_effect=work):
+        with patch("app.main.SessionLocal", factory), patch("app.main._coverage_cache.warm"), patch("app.main._import_gpx_bundles", side_effect=work):
             res = await api_import_gpx_start(req, csrf_token="test", files=[upload()])
             self.assertEqual(res.status_code, 202)
             jid = json.loads(res.body)["job_id"]
@@ -67,17 +69,20 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(done["result"]["imported"], 1)
 
     async def test_http_start_and_poll_work_while_enrichment_is_waiting(self):
-        gate = asyncio.Event()
+        gate = threading.Event()
+        started = threading.Event()
 
         async def work(*args, **kwargs):
-            await gate.wait()
+            started.set()
+            if not gate.wait(5):
+                raise TimeoutError("worker non sbloccato")
             return {"imported": 1}
 
         cookie = TimestampSigner(APP_SECRET_KEY).sign(base64.b64encode(json.dumps(request().session).encode())).decode()
         factory = Mock()
         factory.return_value.__enter__ = Mock(return_value=Mock())
         factory.return_value.__exit__ = Mock(return_value=False)
-        with patch("app.main.SessionLocal", factory), patch("app.main._import_gpx_bundles", side_effect=work):
+        with patch("app.main.SessionLocal", factory), patch("app.main._coverage_cache.warm"), patch("app.main._import_gpx_bundles", side_effect=work):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test", cookies={SESSION_COOKIE_NAME: cookie}) as client:
                 try:
                     res = await asyncio.wait_for(client.post(
@@ -85,7 +90,12 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
                     ), timeout=2)
                     self.assertEqual(res.status_code, 202)
                     url = f"/api/manual-import/jobs/{res.json()['job_id']}"
-                    poll = await client.get(url)
+                    for _ in range(100):
+                        if started.is_set():
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertTrue(started.is_set())
+                    poll = await asyncio.wait_for(client.get(url), timeout=1)
                     self.assertEqual(poll.status_code, 200)
                     self.assertEqual(poll.json()["status"], "running")
                 finally:
@@ -98,6 +108,12 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as exc:
                 await api_import_gpx_start(req, csrf_token=token, files=[upload()])
             self.assertEqual(exc.exception.status_code, code)
+
+    async def test_full_queue_rejects_further_jobs_without_starting_a_worker(self):
+        GPX_IMPORT_JOBS.update({str(i): {"status": "running"} for i in range(8)})
+        with self.assertRaises(HTTPException) as exc:
+            await api_import_gpx_start(request(), csrf_token="test", files=[upload()])
+        self.assertEqual(exc.exception.status_code, 429)
 
     async def test_status_is_private_to_the_admin_session(self):
         GPX_IMPORT_JOBS["job"] = {"status": "running", "_owner": "test"}
@@ -131,5 +147,57 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result["routes"])
             result = await _import_gpx_bundles(request(), db, bundles, 1, include_routes=False)
             self.assertEqual(result["skipped_filename"], 1)
+            self.assertEqual(len(list(db.scalars(select(Route)))), 1)
+        engine.dispose()
+
+    async def test_database_connection_is_released_during_parsing_and_enrichment(self):
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        active = 0
+
+        def checkout(*args):
+            nonlocal active
+            active += 1
+
+        def checkin(*args):
+            nonlocal active
+            active -= 1
+
+        event.listen(engine, "checkout", checkout)
+        event.listen(engine, "checkin", checkin)
+
+        def parse(*args, **kwargs):
+            self.assertEqual(active, 0)
+            return {"sport_type": "skating", "distance_m": 1500}
+
+        async def enrich(db, data):
+            self.assertIsNone(db)
+            self.assertEqual(active, 0)
+            await asyncio.sleep(0)
+            return data
+
+        bundles = {"test": {".gpx": ("test.gpx", b"<gpx/>")}}
+        with Session(engine) as db, \
+             patch("app.main.parse_gpx_bytes", side_effect=parse), \
+             patch("app.main._normalize_for_storage", return_value={"enrichment": {}}), \
+             patch("app.main._enrich_route_data", side_effect=enrich), \
+             patch("app.main._store_routes"), patch("app.main._write_audit_log_for_actor"):
+            await _import_gpx_bundles(request(), db, bundles, 1, include_routes=False)
+        self.assertEqual(active, 0)
+        engine.dispose()
+
+    async def test_successful_files_remain_committed_if_a_later_file_is_invalid(self):
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        raw = b'''<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><type>skating</type><trkseg>
+        <trkpt lat="45" lon="9"><time>2026-10-01T10:00:00Z</time></trkpt>
+        <trkpt lat="45" lon="9.02"><time>2026-10-01T10:05:00Z</time></trkpt>
+        </trkseg></trk></gpx>'''
+        bundles = {"ok": {".gpx": ("ok.gpx", raw)}, "bad": {".gpx": ("bad.gpx", b"invalid")}}
+        with Session(engine) as db, \
+             patch("app.main._enrich_route_data", new=AsyncMock(side_effect=lambda db, data: data)):
+            with self.assertRaises(Exception):
+                await _import_gpx_bundles(request(), db, bundles, 2, include_routes=False)
+        with Session(engine) as db:
             self.assertEqual(len(list(db.scalars(select(Route)))), 1)
         engine.dispose()

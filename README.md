@@ -79,7 +79,11 @@ Verifica: `python -m unittest discover -s tests -v` e `node --test tests/coverag
 
 ## Import GPX in produzione
 
-La dashboard invia un percorso alla volta, con eventuale JSON omonimo, e avvia l'elaborazione in background tramite `/api/manual-import/gpx/start`. L'avanzamento è letto da `/api/manual-import/jobs/{id}`: le attese per OSM e meteo non tengono aperta la richiesta di upload. Il limite applicativo è 20 MB per percorso e relativi file; il reverse proxy deve accettare almeno 25 MB (`client_max_body_size 25m` su nginx, come nell'esempio in `docker/nginx/default.conf`). Il nginx installato sull'host va configurato separatamente.
+La dashboard invia blocchi sequenziali di massimo 5 percorsi e 4 MB complessivi, mantenendo insieme GPX e JSON omonimo. Un singolo percorso più grande viene inviato da solo, fino al limite applicativo di 20 MB per richiesta. `/api/manual-import/gpx/start` risponde con HTTP 202 e l'avanzamento per file viene letto da `/api/manual-import/jobs/{id}`. Gli errori temporanei di rete o proxy durante la lettura dello stato vengono ritentati senza ripetere l'upload.
+
+Parsing, arricchimento e salvataggio avvengono in un worker dedicato, con un solo import attivo e massimo 8 blocchi in coda/elaborazione. La sessione DB rilascia la connessione prima del parsing e delle chiamate OSM/meteo, riaprendola per le letture e i salvataggi necessari. Ogni percorso viene salvato con un commit separato: un errore successivo non annulla quelli già importati. La cache coverage viene aggiornata a fine blocco, anche in caso di errore dopo salvataggi parziali.
+
+Il reverse proxy deve accettare almeno 25 MB (`client_max_body_size 25m` su nginx, come nell'esempio in `docker/nginx/default.conf`). Il nginx installato sull'host va configurato separatamente.
 
 I job manuali sono riservati alla sessione admin che li ha avviati e restano in memoria nel processo web. Un riavvio interrompe i job in corso: verificare i percorsi salvati prima di ripetere il caricamento. I filename già importati vengono scartati. Applicare insieme frontend e backend aggiornati; in produzione ricostruire il servizio web, poi ricaricare il browser con Ctrl+F5.
 

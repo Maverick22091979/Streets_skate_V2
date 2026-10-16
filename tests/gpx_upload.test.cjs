@@ -17,11 +17,12 @@ function setup(fetch) {
   const ctx = {
     window: {
       sessionGuard: { beginTask: () => { holds += 1; return () => { holds -= 1; }; } },
-      setTimeout: (fn) => setImmediate(fn),
+      setTimeout: (fn, ms) => ms === 30000 ? null : setImmediate(fn),
+      clearTimeout() {},
     },
     setTimeout: () => {},
     FormData: class { constructor() { this.fields = []; } append(...args) { this.fields.push(args); } },
-    fetch, encodeURIComponent,
+    fetch, encodeURIComponent, AbortController,
     csrfToken: 'csrf', csrfHeaders: () => ({}),
     gpxFiles: { files: [{ name: 'a.gpx', size: 100 }, { name: 'a.json', size: 100 }, { name: 'b.gpx', size: 100 }] },
     statusText: {}, gpxUploadState: {}, uploadGpxBtn: {},
@@ -41,7 +42,7 @@ test('HTML gateway errors report their HTTP status instead of a JSON syntax erro
   await assert.rejects(ctx.readImportResponse(response(413, '<html>Request too large</html>')), /HTTP 413.*grandi/);
 });
 
-test('uploads one GPX at a time, polls pending jobs, and holds the session until completion', async () => {
+test('uploads bounded blocks, polls pending jobs, and holds the session until completion', async () => {
   let starts = 0;
   let polls = 0;
   let env;
@@ -50,20 +51,49 @@ test('uploads one GPX at a time, polls pending jobs, and holds the session until
     if (url.endsWith('/start')) {
       starts += 1;
       const files = opts.body.fields.filter(([key]) => key === 'files').map(([, value]) => value);
-      assert.equal(files.filter((f) => f.name.endsWith('.gpx')).length, 1);
+      assert.equal(files.filter((f) => f.name.endsWith('.gpx')).length, 2);
       return response(202, { job_id: `job${starts}` });
     }
     polls += 1;
     if (polls === 1) return response(200, { status: 'running' });
-    return response(200, { status: 'done', result: { imported: 1, total_cached: starts } });
+    return response(200, { status: 'done', result: { imported: 2, total_cached: 2 } });
   });
   await env.ctx.uploadGpx();
-  assert.equal(starts, 2);
-  assert.equal(polls, 3);
+  assert.equal(starts, 1);
+  assert.equal(polls, 2);
   assert.equal(env.holds, 0);
   assert.equal(env.refreshes, 1);
   assert.equal(env.ctx.uploadGpxBtn.disabled, false);
   assert.match(env.ctx.gpxUploadState.textContent, /Import completato: 2 percorsi/);
+});
+
+test('blocks respect count and byte limits and keep matching JSON with its GPX', () => {
+  const { ctx } = setup();
+  const groups = Array.from({ length: 12 }, (_, i) => [{ name: `${i}.gpx`, size: 100 }]);
+  assert.deepEqual(Array.from(ctx.gpxBatches(groups), (b) => b.length), [5, 5, 2]);
+  const pair = [{ name: 'a.gpx', size: 3 * 1024 * 1024 }, { name: 'a.json', size: 1024 * 1024 }];
+  const large = [{ name: 'b.gpx', size: 6 * 1024 * 1024 }];
+  const batches = ctx.gpxBatches([pair, large, groups[0]]);
+  assert.deepEqual(Array.from(batches, (b) => b.length), [1, 1, 1]);
+  assert.equal(batches[0][0], pair);
+});
+
+test('a transient polling timeout is retried without re-uploading files', async () => {
+  let starts = 0;
+  let polls = 0;
+  const env = setup(async (url) => {
+    if (url.endsWith('/start')) {
+      starts += 1;
+      return response(202, { job_id: 'job' });
+    }
+    polls += 1;
+    if (polls === 1) return response(504, '<html>Timeout</html>');
+    return response(200, { status: 'done', result: { imported: 2 } });
+  });
+  await env.ctx.uploadGpx();
+  assert.equal(starts, 1);
+  assert.equal(polls, 2);
+  assert.match(env.ctx.gpxUploadState.textContent, /Import completato/);
 });
 
 test('failed background imports display the actual error and release the session', async () => {
