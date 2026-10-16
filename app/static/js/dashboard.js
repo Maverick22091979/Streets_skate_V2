@@ -809,19 +809,21 @@ function gpxBatches(groups, maxCount = 5, maxBytes = 4 * 1024 * 1024) {
   return batches;
 }
 
-async function gpxJobStatus(id) {
+async function gpxJobStatus(id, onRetry = () => {}) {
   for (let attempt = 0; ; attempt += 1) {
     const ctrl = new AbortController();
     const timer = window.setTimeout(() => ctrl.abort(), 30000);
     try {
       const response = await fetch(`/api/manual-import/jobs/${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctrl.signal });
-      if ([502, 503, 504, 522, 524].includes(response.status)) {
+      if ([408, 429, 502, 503, 504, 522, 524].includes(response.status)) {
         throw Object.assign(new Error(`HTTP ${response.status}: stato import temporaneamente non disponibile`), { retryable: true });
       }
       return await readImportResponse(response);
     } catch (err) {
-      if (attempt >= 3 || !(err.retryable || err.name === 'TypeError' || err.name === 'AbortError')) throw err;
-      await new Promise((resolve) => window.setTimeout(resolve, 2000 * (attempt + 1)));
+      if (!(ctrl.signal.aborted || err.retryable || err.name === 'TypeError' || err.name === 'AbortError')) throw err;
+      window.clearTimeout(timer);
+      onRetry(attempt + 1);
+      await new Promise((resolve) => window.setTimeout(resolve, Math.min(15000, 2000 * (attempt + 1))));
     } finally {
       window.clearTimeout(timer);
     }
@@ -886,8 +888,13 @@ async function uploadGpx(ev) {
       let job;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        job = await gpxJobStatus(start.job_id);
+        job = await gpxJobStatus(start.job_id, () => {
+          const message = `Connessione rallentata: riconnessione allo stesso import in corso (${processedBundles}/${groups.length} percorsi completati). Non ricaricare i file.`;
+          statusText.textContent = message;
+          if (gpxUploadState) gpxUploadState.textContent = message;
+        });
         const done = processedBundles + Math.min(batch.length, Number(job.done || 0));
+        statusText.textContent = `Import in corso: ${done}/${groups.length} percorsi`;
         setGpxProgress(done, groups.length, `${done} / ${groups.length} percorsi`);
         if (gpxUploadState && job.status === 'running') {
           gpxUploadState.textContent = job.phase === 'queued'

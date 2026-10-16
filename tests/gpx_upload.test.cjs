@@ -96,6 +96,44 @@ test('a transient polling timeout is retried without re-uploading files', async 
   assert.match(env.ctx.gpxUploadState.textContent, /Import completato/);
 });
 
+test('repeated browser aborts keep polling the same import and preserve the session hold', async () => {
+  let starts = 0;
+  let polls = 0;
+  const env = setup(async (url, opts) => {
+    if (url.endsWith('/start')) {
+      starts += 1;
+      return response(202, { job_id: 'same-job' });
+    }
+    assert.equal(url, '/api/manual-import/jobs/same-job');
+    assert.equal(env.holds, 1);
+    polls += 1;
+    if (polls <= 5) {
+      return new Promise((resolve, reject) => opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true }));
+    }
+    assert.match(env.ctx.gpxUploadState.textContent, /riconnessione allo stesso import/);
+    return response(200, { status: 'done', result: { imported: 2 } });
+  });
+  env.ctx.window.setTimeout = (fn) => setImmediate(fn);
+  env.ctx.window.clearTimeout = (id) => clearImmediate(id);
+  await env.ctx.uploadGpx();
+  assert.equal(starts, 1);
+  assert.equal(polls, 6);
+  assert.equal(env.holds, 0);
+  assert.match(env.ctx.gpxUploadState.textContent, /Import completato/);
+});
+
+test('session expiry and missing jobs stop polling without retrying', async () => {
+  for (const status of [403, 404]) {
+    let polls = 0;
+    const env = setup(async () => {
+      polls += 1;
+      return response(status, { detail: 'Sessione o job non disponibile' });
+    });
+    await assert.rejects(env.ctx.gpxJobStatus('job'), new RegExp(`HTTP ${status}`));
+    assert.equal(polls, 1);
+  }
+});
+
 test('failed background imports display the actual error and release the session', async () => {
   const env = setup(async (url) => url.endsWith('/start')
     ? response(202, { job_id: 'job' })
