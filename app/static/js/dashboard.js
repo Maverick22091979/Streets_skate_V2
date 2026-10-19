@@ -351,9 +351,9 @@ function hideImportFooter(delayMs = 0) {
 
 async function pollImportJob(jobId) {
   while (true) {
-    const response = await fetch(`/api/import-jobs/${jobId}`);
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Errore stato import');
+    const data = await importJobStatus(jobId, () => {
+      statusText.textContent = 'Connessione rallentata: riconnessione allo stesso import Strava in corso...';
+    }, '/api/import-jobs/');
     stopImportPulse();
     const cur = data.current ? ` · ${data.current}` : '';
     setImportProgress(data.done || 0, data.total || 0, `Import ${provider}`);
@@ -361,7 +361,7 @@ async function pollImportJob(jobId) {
     statusText.textContent = `Import da ${provider} in corso... ${(data.done || 0)}/${data.total || 0}${cur}`;
     if (data.status === 'done') return data.result;
     if (data.status === 'error') throw new Error(data.error || 'Errore import');
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 2000));
   }
 }
 
@@ -809,12 +809,12 @@ function gpxBatches(groups, maxCount = 5, maxBytes = 4 * 1024 * 1024) {
   return batches;
 }
 
-async function gpxJobStatus(id, onRetry = () => {}) {
+async function importJobStatus(id, onRetry = () => {}, path = '/api/manual-import/jobs/') {
   for (let attempt = 0; ; attempt += 1) {
     const ctrl = new AbortController();
     const timer = window.setTimeout(() => ctrl.abort(), 30000);
     try {
-      const response = await fetch(`/api/manual-import/jobs/${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctrl.signal });
+      const response = await fetch(`${path}${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctrl.signal });
       if ([408, 429, 502, 503, 504, 522, 524].includes(response.status)) {
         throw Object.assign(new Error(`HTTP ${response.status}: stato import temporaneamente non disponibile`), { retryable: true });
       }
@@ -888,7 +888,7 @@ async function uploadGpx(ev) {
       let job;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        job = await gpxJobStatus(start.job_id, () => {
+        job = await importJobStatus(start.job_id, () => {
           const message = `Connessione rallentata: riconnessione allo stesso import in corso (${processedBundles}/${groups.length} percorsi completati). Non ricaricare i file.`;
           statusText.textContent = message;
           if (gpxUploadState) gpxUploadState.textContent = message;
@@ -963,14 +963,15 @@ async function loadRoutes() {
 
 async function importRoutes() {
   if (!provider || provider === 'admin' || !statusText || !importAllowed) return;
+  if (importBtn.disabled) return;
+  const end = window.sessionGuard?.beginTask() || (() => {});
   statusText.textContent = `Import da ${provider} in corso...`;
   importBtn.disabled = true;
   startImportPulse(`Import ${provider}`);
   setImportFooter(0, 0, `Import ${provider}`);
   try {
     const start = await fetch(`/api/import/${provider}/start`, { method: 'POST', headers: csrfHeaders() });
-    const startData = await start.json();
-    if (!start.ok) throw new Error(startData.detail || startData.error || 'Errore avvio import');
+    const startData = await readImportResponse(start);
     let data = startData.result;
     stopImportPulse();
     setImportProgress(startData.done || 0, startData.total || 0, `Import ${provider}`);
@@ -979,11 +980,13 @@ async function importRoutes() {
     allRoutes = data.routes || [];
     renderRoutes(allRoutes);
     statusText.textContent = `Importati ${data.imported} percorsi${shortSkipMessage(data.skipped_short || 0, data.skipped_short_names || [])}. Totale cache: ${data.total_cached}`;
+    if (data.warnings?.length) statusText.textContent += ` Avvisi: ${data.warnings.join(' ')}`;
     setImportFooter(data.imported || 0, data.total || 0, `Import ${provider} completato`);
     hideImportFooter(8000);
   } catch (err) {
     statusText.textContent = `Errore: ${err.message}`;
   } finally {
+    end();
     stopImportPulse();
     importBtn.disabled = false;
   }

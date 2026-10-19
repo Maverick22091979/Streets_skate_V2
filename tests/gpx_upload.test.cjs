@@ -129,9 +129,41 @@ test('session expiry and missing jobs stop polling without retrying', async () =
       polls += 1;
       return response(status, { detail: 'Sessione o job non disponibile' });
     });
-    await assert.rejects(env.ctx.gpxJobStatus('job'), new RegExp(`HTTP ${status}`));
+    await assert.rejects(env.ctx.importJobStatus('job'), new RegExp(`HTTP ${status}`));
     assert.equal(polls, 1);
   }
+});
+
+test('provider status retries use the provider job URL rather than the GPX URL', async () => {
+  let polls = 0;
+  const env = setup(async (url) => {
+    assert.equal(url, '/api/import-jobs/strava-job');
+    polls += 1;
+    if (polls === 1) return response(504, '<html>Timeout</html>');
+    return response(200, { status: 'done', result: { imported: 52 } });
+  });
+  const result = await env.ctx.importJobStatus('strava-job', () => {}, '/api/import-jobs/');
+  assert.equal(polls, 2);
+  assert.equal(result.result.imported, 52);
+});
+
+test('provider import keeps the session held through polling and shows stream warnings', async () => {
+  const env = setup(async () => response(200, { job_id: 'strava-job' }));
+  Object.assign(env.ctx, {
+    provider: 'strava', importAllowed: true, importBtn: {}, allRoutes: [],
+    startImportPulse() {}, stopImportPulse() {}, setImportFooter() {},
+    setImportProgress() {}, hideImportFooter() {}, renderRoutes() {},
+    pollImportJob: async () => {
+      assert.equal(env.holds, 1);
+      return { imported: 52, total_cached: 52, routes: [], warnings: ['GPS dettagliato non disponibile'] };
+    },
+  });
+  vm.runInContext(src.slice(src.indexOf('async function importRoutes'), src.indexOf('if (reloadBtn)')), env.ctx);
+  await env.ctx.importRoutes();
+  assert.equal(env.holds, 0);
+  assert.equal(env.ctx.importBtn.disabled, false);
+  assert.match(env.ctx.statusText.textContent, /Importati 52 percorsi/);
+  assert.match(env.ctx.statusText.textContent, /GPS dettagliato non disponibile/);
 });
 
 test('failed background imports display the actual error and release the session', async () => {

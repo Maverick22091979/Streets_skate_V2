@@ -1,8 +1,10 @@
 import base64
+import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
@@ -124,20 +126,62 @@ class ProviderAdapter:
 
 
 class StravaAdapter(ProviderAdapter):
+    async def _get(self, url: str, token: str, params: dict[str, Any]) -> Any:
+        async with httpx.AsyncClient(timeout=30) as c:
+            for attempt in range(4):
+                r = await c.get(url, headers=self.api_headers(token), params=params)
+                if r.status_code != 429:
+                    r.raise_for_status()
+                    return r.json()
+                for prefix in ("X-ReadRateLimit", "X-RateLimit"):
+                    limits = r.headers.get(f"{prefix}-Limit", "").split(",")
+                    used = r.headers.get(f"{prefix}-Usage", "").split(",")
+                    if len(limits) == len(used) == 2 and int(used[1]) >= int(limits[1]):
+                        raise RuntimeError("Limite giornaliero Strava raggiunto. I percorsi salvati restano disponibili: riprova domani.")
+                if attempt == 3:
+                    r.raise_for_status()
+                delay = r.headers.get("Retry-After", "")
+                seconds = int(delay) if delay.isdigit() else 901 - int(time.time()) % 900
+                await asyncio.sleep(max(1, min(seconds, 901)))
+
     def auth_params(self, state: str) -> dict[str, Any]:
         p = super().auth_params(state)
         p["approval_prompt"] = env_value("STRAVA_APPROVAL_PROMPT", "force")
         return p
 
     async def fetch_activities(self, token: str, connection: AuthConnection, page: int, per_page: int) -> list[dict[str, Any]]:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(
-                self.cfg.activities_url,
-                headers=self.api_headers(token),
-                params={"page": page, "per_page": min(max(per_page, 1), 100)},
-            )
-        r.raise_for_status()
-        return r.json()
+        return await self._get(self.cfg.activities_url, token, {"page": page, "per_page": min(max(per_page, 1), 100)})
+
+    async def fetch_activity_points(self, token: str, activity: dict[str, Any]) -> list[dict[str, Any]]:
+        url = env_value("STRAVA_STREAMS_URL", "https://www.strava.com/api/v3/activities/{activity_id}/streams")
+        body = await self._get(url.format(activity_id=int(activity["id"])), token, {
+            "keys": "latlng,altitude,time,distance,velocity_smooth", "key_by_type": "true",
+        })
+        if isinstance(body, list):
+            body = {stream["type"]: stream for stream in body}
+        streams = {key: value.get("data") or [] for key, value in body.items() if isinstance(value, dict)}
+        start = activity.get("start_date") or activity.get("start_date_local")
+        start = datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
+        points = []
+        for i, pair in enumerate(streams.get("latlng", [])):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            try:
+                lat, lng = map(float, pair)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(lat) or not math.isfinite(lng) or not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                continue
+            point = {"lat": lat, "lng": lng}
+            for key, field in (("altitude", "elevation"), ("distance", "cumulative_distance_m"), ("velocity_smooth", "speed_kmh")):
+                values = streams.get(key, [])
+                if i < len(values) and values[i] is not None:
+                    point[field] = float(values[i]) * (3.6 if key == "velocity_smooth" else 1)
+            times = streams.get("time", [])
+            if start and i < len(times) and times[i] is not None:
+                point["time"] = (start + timedelta(seconds=float(times[i]))).isoformat()
+            points.append(point)
+        return points
 
     def connection_identity(self, token_data: dict[str, Any], profile: dict[str, Any]) -> tuple[str, str | None, str | None]:
         athlete = token_data.get("athlete") or profile or {}

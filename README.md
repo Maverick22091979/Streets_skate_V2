@@ -77,6 +77,16 @@ Il confronto usa una tolleranza GPS di 12 m, senza aggancio alla rete stradale; 
 
 Verifica: `python -m unittest discover -s tests -v` e `node --test tests/coverage.test.cjs tests/session_guard.test.cjs`.
 
+## Import Strava
+
+L'import della dashboard scorre automaticamente tutte le pagine delle attività fino alla prima pagina vuota, anche se una pagina intermedia contiene meno elementi del previsto. Per ogni attività acquisisce gli stream GPS `latlng`, `altitude`, `time`, `distance` e `velocity_smooth` quando disponibili. I punti dettagliati vengono usati dal profilo del percorso e dalla coverage; la polyline semplificata rimane disponibile come fallback.
+
+Ripetere l'import aggiorna nello stesso record le attività precedentemente salvate con la sola traccia semplificata. Le attività con GPS dettagliato già acquisito vengono riutilizzate senza riscaricare gli stream. Se il recupero del singolo stream fallisce, l'import continua con la geometria semplificata e restituisce un avviso; un import successivo può ritentarlo. Le attività manuali non richiedono stream.
+
+L'elaborazione della dashboard avviene in un worker separato, salva ogni attività prima di passare alla successiva e rilascia la connessione DB durante l'acquisizione GPS e l'arricchimento esterno. I timeout temporanei del monitoraggio non reinviano l'import e il polling rinnova la sessione. Al raggiungimento di un limite API temporaneo viene atteso il nuovo intervallo (fino a tre tentativi); il limite giornaliero interrompe il job con un messaggio esplicito, mantenendo quanto già salvato. Resta necessario rispettare scope, visibilità e limiti assegnati all'app Strava.
+
+Documentazione: [attività e stream](https://developers.strava.com/docs/reference/). Verifica locale: `python -m unittest discover -s tests -p test_strava_import.py -v`.
+
 ## Import GPX in produzione
 
 La dashboard invia blocchi sequenziali di massimo 5 percorsi e 4 MB complessivi, mantenendo insieme GPX e JSON omonimo. Un singolo percorso più grande viene inviato da solo, fino al limite applicativo di 20 MB per richiesta. `/api/manual-import/gpx/start` risponde con HTTP 202 e l'avanzamento per file viene letto da `/api/manual-import/jobs/{id}`. Gli errori temporanei di rete o proxy durante la lettura dello stato vengono ritentati senza ripetere l'upload. Anche dopo timeout ripetuti del browser (30 secondi per richiesta), il monitoraggio dello stesso job continua con pause fino a 15 secondi e avviso di riconnessione. Sessione scaduta, job non trovato ed errori di elaborazione interrompono l'import con un messaggio esplicito.

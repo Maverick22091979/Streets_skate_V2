@@ -150,6 +150,7 @@ IMPORT_JOBS: dict[str, dict[str, Any]] = {}
 GPX_IMPORT_JOBS: dict[str, dict[str, Any]] = {}
 GPX_IMPORT_TASKS: set[asyncio.Task] = set()
 GPX_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpx-import")
+PROVIDER_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="provider-import")
 GPX_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 FAILED_ADMIN_LOGINS: dict[str, dict[str, Any]] = {}
 IP_GEO_CACHE: dict[str, dict[str, Any]] = {}
@@ -2041,6 +2042,79 @@ async def _import_adidas_export(
     return _store_routes(db, user, conn, items), len(items), skipped_short, skipped_short_names, total
 
 
+async def _import_strava_archive(db, user, conn, adapter, page, per_page, on_progress=None, warnings=None):
+    user_id, conn_id = user.id, conn.id
+    token = await _refresh_connection_token(adapter, conn, db)
+    db.close()
+    imported = skipped_short = done = total = 0
+    short_names = []
+    seen = set()
+    page = max(1, page)
+    per_page = min(max(1, per_page), 100)
+    try:
+        while True:
+            raw = await adapter.fetch_activities(token, conn, page, per_page)
+            if not raw:
+                break
+            total += len(raw)
+            fresh = False
+            for entry in raw:
+                if not entry or entry.get("id") is None:
+                    done += 1
+                    continue
+                ext_id = str(entry["id"])
+                if ext_id in seen:
+                    done += 1
+                    continue
+                fresh = True
+                seen.add(ext_id)
+                name = entry.get("name") or ext_id
+                if on_progress:
+                    await on_progress(done, total, imported, name)
+                norm = adapter.normalize_activity(entry)
+                source = db.execute(select(Route.enrichment["gps_source"].as_string()).where(Route.provider == "strava", Route.external_id == ext_id)).scalar_one_or_none()
+                complete = source in {"strava-streams", "strava-no-gps"}
+                db.close()
+                if float(norm.get("distance_m") or 0) < MIN_IMPORT_DISTANCE_M:
+                    skipped_short += 1
+                    short_names.append(name)
+                elif not complete:
+                    points = []
+                    gps_source = "strava-no-gps" if entry.get("manual") else "strava-summary"
+                    if not entry.get("manual"):
+                        try:
+                            points = await adapter.fetch_activity_points(token, entry)
+                            gps_source = "strava-streams" if len(points) >= 2 else "strava-no-gps"
+                        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 429}:
+                                raise
+                            if warnings is not None and len(warnings) < 50:
+                                warnings.append(f"{name}: GPS dettagliato non disponibile; mantenuta la traccia semplificata.")
+                    norm["points"] = points if len(points) >= 2 else []
+                    stored = _normalize_for_storage("strava", norm)
+                    stored["enrichment"]["gps_source"] = gps_source
+                    stored = await _enrich_route_data(None, stored)
+                    user = db.get(User, user_id)
+                    conn = db.get(AuthConnection, conn_id)
+                    if not user or not conn:
+                        raise ValueError("Connessione Strava non più disponibile")
+                    enrichment = stored["enrichment"]
+                    enrichment["segment_max_speed_kmh"] = _historical_segment_max_speed(db, enrichment.get("segment_speed_index") or {})
+                    _store_routes(db, user, conn, [stored], load_routes=False, warm_coverage=False)
+                    db.close()
+                    imported += 1
+                done += 1
+                if on_progress:
+                    await on_progress(done, total, imported, name)
+            if not fresh:
+                raise ValueError("Strava ha restituito una pagina già elaborata. Riprova l'import: i percorsi salvati restano disponibili.")
+            page += 1
+        return _user_routes(db, user_id), imported, skipped_short, short_names, total
+    finally:
+        if imported:
+            _coverage_cache.warm()
+
+
 async def _import_provider_api(
     db: Session,
     user: User,
@@ -2049,12 +2123,15 @@ async def _import_provider_api(
     page: int = 1,
     per_page: int = 50,
     on_progress: Any | None = None,
+    warnings: list[str] | None = None,
 ) -> tuple[list[Route], int, int, list[str], int]:
     adapter = PROVIDERS.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Provider non supportato")
     if not adapter.cfg.activities_url:
         raise HTTPException(status_code=400, detail=f"Endpoint attività {adapter.cfg.label} non configurato")
+    if provider == "strava":
+        return await _import_strava_archive(db, user, conn, adapter, page, per_page, on_progress, warnings)
     token = await _refresh_connection_token(adapter, conn, db)
     raw = await adapter.fetch_activities(token, conn, page, per_page)
     items: list[dict[str, Any]] = []
@@ -2083,13 +2160,14 @@ async def _import_provider_api(
     return _store_routes(db, user, conn, items), len(items), skipped_short, skipped_short_names, total
 
 
-def _import_payload(provider: str, routes: list[Route], imported: int, skipped_short: int, skipped_short_names: list[str]) -> dict[str, Any]:
+def _import_payload(provider: str, routes: list[Route], imported: int, skipped_short: int, skipped_short_names: list[str], warnings: list[str] | None = None) -> dict[str, Any]:
     return {
         "imported": imported,
         "skipped_short": skipped_short,
         "skipped_short_names": skipped_short_names,
         "total_cached": len(routes),
         "provider": provider,
+        "warnings": warnings or [],
         "routes": [_serialize_route(r) for r in routes],
     }
 
@@ -2142,9 +2220,14 @@ async def _run_adidas_import_job(job_id: str, user_id: int, conn_id: int) -> Non
         db.close()
 
 
-async def _run_provider_import_job(job_id: str, user_id: int, conn_id: int, provider: str, page: int = 1, per_page: int = 50) -> None:
-    from app.db import SessionLocal
+def _provider_import_worker(job_id, user_id, conn_id, provider, page, per_page):
+    asyncio.run(_run_provider_import_job(job_id, user_id, conn_id, provider, page, per_page, _worker=True))
 
+
+async def _run_provider_import_job(job_id: str, user_id: int, conn_id: int, provider: str, page: int = 1, per_page: int = 50, _worker: bool = False) -> None:
+    if provider == "strava" and not _worker:
+        await asyncio.get_running_loop().run_in_executor(PROVIDER_IMPORT_POOL, _provider_import_worker, job_id, user_id, conn_id, provider, page, per_page)
+        return
     db = SessionLocal()
     try:
         user = db.get(User, user_id)
@@ -2166,8 +2249,9 @@ async def _run_provider_import_job(job_id: str, user_id: int, conn_id: int, prov
             )
             await asyncio.sleep(0)
 
+        warnings = []
         routes, imported, skipped_short, skipped_short_names, total = await _import_provider_api(
-            db, user, conn, provider, page=page, per_page=per_page, on_progress=on_progress
+            db, user, conn, provider, page=page, per_page=per_page, on_progress=on_progress, warnings=warnings,
         )
         IMPORT_JOBS[job_id].update(
             {
@@ -2176,7 +2260,7 @@ async def _run_provider_import_job(job_id: str, user_id: int, conn_id: int, prov
                 "total": total,
                 "imported": imported,
                 "current": None,
-                "result": _import_payload(provider, routes, imported, skipped_short, skipped_short_names),
+                "result": _import_payload(provider, routes, imported, skipped_short, skipped_short_names, warnings),
                 "updated_at": datetime.now(UTC).isoformat(),
             }
         )
@@ -2267,7 +2351,7 @@ def _normalize_for_storage(provider: str, raw: dict[str, Any]) -> dict[str, Any]
     points = raw.get("points") or []
     metrics = raw.get("metrics") or {}
     coords = _decode_polyline(summary_polyline)
-    bbox = _bbox(coords) if coords else _bbox_from_points(points)
+    bbox = _bbox_from_points(points) if points else _bbox(coords)
     enrichment = _local_enrichment_placeholder()
     raw_payload = raw.get("raw_payload") or raw
     if isinstance(raw_payload, dict) and isinstance(raw_payload.get("declared_difficulty"), dict):
@@ -2305,7 +2389,7 @@ def _normalize_for_storage(provider: str, raw: dict[str, Any]) -> dict[str, Any]
         "moving_time_sec": raw.get("moving_time_sec"),
         "summary_polyline": summary_polyline,
         "map_polyline_available": bool(summary_polyline or points),
-        "polyline_points_count": len(coords) if coords else len(points),
+        "polyline_points_count": len(points) if points else len(coords),
         "bbox": bbox,
         "enrichment": enrichment,
         "difficulty": _skate_difficulty(distance_m, elevation_gain_m, enrichment),
@@ -3890,32 +3974,14 @@ async def api_import_provider(
         return JSONResponse(_import_payload(provider, routes, imported, skipped_short, skipped_short_names))
     if not adapter.cfg.activities_url:
         raise HTTPException(status_code=400, detail=f"Endpoint attività {adapter.cfg.label} non configurato")
-    token = await _refresh_connection_token(adapter, conn, db)
+    warnings = []
     try:
-        raw = await adapter.fetch_activities(token, conn, page, per_page)
+        routes, imported, skipped_short, skipped_short_names, _ = await _import_provider_api(
+            db, user, conn, provider, page=page, per_page=per_page, warnings=warnings,
+        )
     except Exception as exc:
         _write_audit_log(db, request, f"import_provider_{provider}", error=str(exc), meta={"page": page, "per_page": per_page})
         raise HTTPException(status_code=400, detail=f"Errore import {adapter.cfg.label}: {exc}") from exc
-    items = []
-    skipped_short = 0
-    skipped_short_names: list[str] = []
-    for entry in raw:
-        if not entry:
-            continue
-        norm = adapter.normalize_activity(entry)
-        if not norm.get("external_id"):
-            continue
-        route_exists = db.execute(
-            select(Route.id).where(Route.provider == provider, Route.external_id == str(norm["external_id"]))
-        ).scalar_one_or_none()
-        if not route_exists and _find_duplicate_route(db, _normalize_for_storage(provider, norm), provider=provider):
-            continue
-        if float(norm.get("distance_m") or 0) < MIN_IMPORT_DISTANCE_M:
-            skipped_short += 1
-            skipped_short_names.append(norm.get("name") or str(norm.get("external_id")))
-            continue
-        items.append(await _enrich_route_data(db, _normalize_for_storage(provider, norm)))
-    routes = _store_routes(db, user, conn, items)
     _write_audit_log(
         db,
         request,
@@ -3923,13 +3989,13 @@ async def api_import_provider(
         meta={
             "page": page,
             "per_page": per_page,
-            "imported": len(items),
+            "imported": imported,
             "skipped_short": skipped_short,
             "total_cached": len(routes),
         },
     )
     return JSONResponse(
-        _import_payload(provider, routes, len(items), skipped_short, skipped_short_names)
+        _import_payload(provider, routes, imported, skipped_short, skipped_short_names, warnings)
     )
 
 
@@ -3947,6 +4013,7 @@ async def api_import_provider_start(request: Request, provider: str, db: Session
     job_id = uuid.uuid4().hex
     IMPORT_JOBS[job_id] = {
         "job_id": job_id,
+        "_connection_id": conn.id,
         "provider": provider,
         "status": "running",
         "done": 0,
@@ -3966,11 +4033,13 @@ async def api_import_provider_start(request: Request, provider: str, db: Session
 
 
 @app.get("/api/import-jobs/{job_id}")
-def api_import_job_status(job_id: str):
+def api_import_job_status(job_id: str, request: Request):
+    if not _touch_or_expire_session(request):
+        raise HTTPException(status_code=401, detail="Sessione scaduta: accedi nuovamente")
     job = IMPORT_JOBS.get(job_id)
-    if not job:
+    if not job or job.get("_connection_id") != request.session.get("connection_id"):
         raise HTTPException(status_code=404, detail="Job import non trovato")
-    return JSONResponse(job)
+    return JSONResponse({key: value for key, value in job.items() if not key.startswith("_")})
 
 
 async def _read_gpx_bundles(files):
