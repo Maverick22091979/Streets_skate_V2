@@ -77,6 +77,10 @@ Il confronto usa una tolleranza GPS di 12 m, senza aggancio alla rete stradale; 
 
 Verifica: `python -m unittest discover -s tests -v` e `node --test tests/coverage.test.cjs tests/session_guard.test.cjs`.
 
+## Ricarica dashboard
+
+La dashboard legge dal DB solo i metadati delle schede, escludendo punti GPS, indici di velocità e campioni delle superfici dalla query. La ricarica usa `/api/routes?after_id=...&limit=25` e segue tutte le pagine; i dettagli completi restano disponibili nella pagina del percorso. Gli errori HTML del proxy vengono mostrati con il codice HTTP e i percorsi già visualizzati vengono mantenuti se la ricarica fallisce. Il conteggio delle schede riflette i filtri attivi.
+
 ## Import Strava
 
 L'import della dashboard scorre automaticamente tutte le pagine delle attività fino alla prima pagina vuota, anche se una pagina intermedia contiene meno elementi del previsto. Per ogni attività acquisisce gli stream GPS `latlng`, `altitude`, `time`, `distance` e `velocity_smooth` quando disponibili. I punti dettagliati vengono usati dal profilo del percorso e dalla coverage; la polyline semplificata rimane disponibile come fallback.

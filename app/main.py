@@ -9,6 +9,7 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
@@ -20,7 +21,8 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Re
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import case, cast, func, literal_column, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import text
 from sqlalchemy.orm import Session, configure_mappers
 from starlette.middleware.sessions import SessionMiddleware
@@ -2522,6 +2524,43 @@ def _all_routes(db: Session) -> list[Route]:
     return list(db.execute(stmt).scalars())
 
 
+def _dashboard_routes(db: Session, after_id: int = 0, limit: int | None = None):
+    fields = [col for col in Route.__table__.columns if col.name not in {"enrichment", "raw_payload", "summary_polyline"}]
+    if db.get_bind().dialect.name == "postgresql":
+        compact = cast(Route.enrichment, JSONB)
+        compact = case((func.jsonb_typeof(compact) == "object", compact), else_=literal_column("'{}'::jsonb"))
+        for key in ("point_profile", "segment_speed_index", "surface_samples"):
+            compact = compact.op("-")(literal_column(f"'{key}'"))
+    else:
+        compact = func.json_remove(Route.enrichment, "$.point_profile", "$.segment_speed_index", "$.surface_samples")
+    stmt = select(
+        *fields,
+        User.display_name.label("_user_label"),
+        AuthConnection.token_type.label("_token_type"),
+        Route.raw_payload["filename"].as_string().label("_filename"),
+        compact.label("_compact"),
+    ).outerjoin(User, User.id == Route.user_id).outerjoin(AuthConnection, AuthConnection.id == Route.connection_id)
+    if limit is not None:
+        stmt = stmt.where(Route.id > after_id).order_by(Route.id).limit(limit)
+    else:
+        stmt = stmt.order_by(Route.start_date_local.desc().nullslast(), Route.id.desc())
+    routes = []
+    for row in db.execute(stmt).mappings():
+        data = dict(row)
+        enrichment = data.pop("_compact") or {}
+        if isinstance(enrichment, str):
+            enrichment = json.loads(enrichment)
+        route = SimpleNamespace(
+            **data,
+            enrichment=enrichment,
+            raw_payload={"filename": data["_filename"]},
+            user=SimpleNamespace(display_name=data["_user_label"]),
+            connection=SimpleNamespace(token_type=data["_token_type"]),
+        )
+        routes.append(_serialize_route(route))
+    return routes
+
+
 def _current_provider_context(conn: AuthConnection | None) -> dict[str, Any]:
     if not conn:
         return {"provider_key": None, "provider_label": None}
@@ -3360,7 +3399,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             "read_only": False,
             "can_change_password": bool(_current_local_user(request, db)),
         }
-        routes = [_serialize_route(r) for r in _all_routes(db)]
+        routes = _dashboard_routes(db)
         return templates.TemplateResponse(
             "dashboard.html",
             {
@@ -3385,7 +3424,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     ctx["import_autostart"] = bool(request.session.pop("import_autostart", False))
     ctx["can_change_password"] = bool(_current_local_user(request, db))
     ctx["support_available"] = True
-    routes = [_serialize_route(r) for r in _all_routes(db)]
+    routes = _dashboard_routes(db)
     return templates.TemplateResponse(
         "dashboard.html",
         {
@@ -3908,16 +3947,22 @@ def route_detail(route_id: int, request: Request, db: Session = Depends(get_db))
 
 
 @app.get("/api/routes")
-def api_routes(request: Request, db: Session = Depends(get_db)):
+def api_routes(request: Request, db: Session = Depends(get_db), after_id: int = Query(0, ge=0), limit: int | None = Query(None, ge=1, le=100)):
     local_admin = _get_local_admin(request)
-    if local_admin:
-        routes = [_serialize_route(r) for r in _all_routes(db)]
-        return JSONResponse({"routes": routes, "provider": "admin", "users": _admin_route_users(db)})
-    user, conn = _get_session_user(request, db)
-    if not user or not conn:
-        raise HTTPException(status_code=401, detail="Sessione non autenticata")
-    routes = [_serialize_route(r) for r in _all_routes(db)]
-    return JSONResponse({"routes": routes, "provider": conn.provider, "users": _admin_route_users(db)})
+    provider = "admin"
+    if not local_admin:
+        user, conn = _get_session_user(request, db)
+        if not user or not conn:
+            raise HTTPException(status_code=401, detail="Sessione non autenticata")
+        provider = conn.provider
+    rows = _dashboard_routes(db, after_id, limit + 1 if limit is not None else None)
+    routes = rows[:limit] if limit is not None else rows
+    return JSONResponse({
+        "routes": routes, "provider": provider,
+        "users": _admin_route_users(db) if after_id == 0 else [],
+        "has_more": limit is not None and len(rows) > limit,
+        "next_after": routes[-1]["id"] if routes else after_id,
+    }, headers={"Cache-Control": "no-store"})
 
 
 @app.delete("/api/routes/{route_id}")

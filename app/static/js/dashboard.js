@@ -777,15 +777,15 @@ async function readImportResponse(response) {
       413: 'File troppo grandi per il proxy: verifica client_max_body_size in nginx.',
       502: 'Il proxy non riesce a raggiungere il servizio web.',
       503: 'Il servizio web non è disponibile.',
-      504: 'Timeout del proxy durante l’import.',
+      504: 'Timeout del proxy durante la richiesta.',
       522: 'Timeout di connessione al server di produzione.',
-      524: 'Timeout Cloudflare durante l’import.',
+      524: 'Timeout Cloudflare durante la richiesta.',
     };
     if (response.redirected) throw new Error('Sessione scaduta: accedi nuovamente e riprova.');
     throw new Error(`HTTP ${response.status}: ${reasons[response.status] || 'Il server ha restituito una pagina HTML o una risposta non valida. Controlla i log di nginx e del servizio web.'}`);
   }
   if (!response.ok) {
-    const detail = data.detail || data.error || 'Errore import GPX';
+    const detail = data.detail || data.error || 'Richiesta non riuscita';
     throw new Error(`HTTP ${response.status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
   }
   return data;
@@ -934,14 +934,27 @@ async function uploadGpx(ev) {
 
 async function loadRoutes() {
   if (!grid || !statusText) return;
+  if (reloadBtn?.disabled) return;
+  const end = window.sessionGuard?.beginTask() || (() => {});
+  if (reloadBtn) reloadBtn.disabled = true;
   statusText.textContent = 'Caricamento cache locale...';
-  grid.innerHTML = '';
   try {
-    const response = await fetch('/api/routes');
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || data.error || 'Errore API');
-    const routes = data.routes || [];
-    renderUserFilter(data.users || []);
+    const loaded = new Map();
+    let after = 0;
+    let users = [];
+    while (true) {
+      const response = await fetch(`/api/routes?after_id=${after}&limit=25`, { cache: 'no-store' });
+      const data = await readImportResponse(response);
+      if (after === 0) users = data.users || [];
+      for (const route of data.routes || []) loaded.set(route.id, route);
+      statusText.textContent = `Caricamento cache locale: ${loaded.size} percorsi...`;
+      if (!data.has_more) break;
+      const next = Number(data.next_after);
+      if (!Number.isFinite(next) || next <= after) throw new Error('Avanzamento del caricamento non valido. Riprova.');
+      after = next;
+    }
+    const routes = [...loaded.values()].sort((a, b) => String(b.start_date_local || '').localeCompare(String(a.start_date_local || '')) || b.id - a.id);
+    renderUserFilter(users);
     allRoutes = routes;
     if (provider === 'admin') {
       const filtered = renderRoutes(allRoutes);
@@ -958,6 +971,9 @@ async function loadRoutes() {
     statusText.textContent = isReadOnly ? `${filtered.length} percorsi disponibili in archivio globale` : `${filtered.length} percorsi in cache locale`;
   } catch (err) {
     statusText.textContent = `Errore: ${err.message}`;
+  } finally {
+    end();
+    if (reloadBtn) reloadBtn.disabled = false;
   }
 }
 

@@ -158,7 +158,8 @@ test('provider import keeps the session held through polling and shows stream wa
       return { imported: 52, total_cached: 52, routes: [], warnings: ['GPS dettagliato non disponibile'] };
     },
   });
-  vm.runInContext(src.slice(src.indexOf('async function importRoutes'), src.indexOf('if (reloadBtn)')), env.ctx);
+  const start = src.indexOf('async function importRoutes');
+  vm.runInContext(src.slice(start, src.indexOf('if (reloadBtn)', start)), env.ctx);
   await env.ctx.importRoutes();
   assert.equal(env.holds, 0);
   assert.equal(env.ctx.importBtn.disabled, false);
