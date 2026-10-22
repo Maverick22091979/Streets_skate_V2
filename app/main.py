@@ -307,12 +307,18 @@ def _log_session_timeout(request: Request, reason: str) -> None:
     db = None
     try:
         db = SessionLocal()
-        _write_audit_log(
+        session = _session_store(request)
+        admin = session.get("local_admin")
+        admin = admin if isinstance(admin, dict) else {}
+        _write_audit_log_for_actor(
             db,
-            request,
             "session_timeout",
+            "Admin" if admin else "Utente loggato",
+            admin.get("label") or f"Utente {session.get('user_id') or 'n.d.'}",
+            admin.get("username"),
             error=reason,
             meta={"timeout_sec": SESSION_INACTIVITY_TIMEOUT_SEC, "path": str(request.url.path)},
+            request=request,
         )
     except Exception:
         pass
@@ -340,7 +346,11 @@ def _touch_or_expire_session(request: Request) -> bool:
         _log_session_timeout(request, reason)
         request.session.clear()
         return False
-    if SESSION_INACTIVITY_TIMEOUT_SEC > 0 and now - last_seen_at > SESSION_INACTIVITY_TIMEOUT_SEC:
+    active_import = bool(session.get("local_admin") and session.get("csrf_token") and any(
+        job.get("status") == "running" and job.get("_owner") == session["csrf_token"]
+        for job in list(GPX_IMPORT_JOBS.values())
+    ))
+    if SESSION_INACTIVITY_TIMEOUT_SEC > 0 and now - last_seen_at > SESSION_INACTIVITY_TIMEOUT_SEC and not active_import:
         reason = "Sessione scaduta per inattività. Esegui di nuovo il login."
         _log_session_timeout(request, reason)
         request.session.clear()
@@ -2577,6 +2587,14 @@ def _is_admin(request: Request) -> bool:
     return bool(_get_local_admin(request))
 
 
+def _require_gpx_admin(request: Request) -> None:
+    if _is_admin(request):
+        return
+    if not _has_authenticated_session(request):
+        raise HTTPException(status_code=401, detail="Sessione scaduta o non valida. Accedi nuovamente con un account admin e riprova i file: quelli già salvati vengono riconosciuti.")
+    raise HTTPException(status_code=403, detail="La sessione corrente non è admin. Esci e accedi con un account admin per importare i GPX.")
+
+
 def _get_or_create_admin_entities(db: Session) -> tuple[User, AuthConnection]:
     stmt = select(AuthConnection).where(AuthConnection.provider == "manual", AuthConnection.provider_user_id == "local_admin")
     conn = db.execute(stmt).scalar_one_or_none()
@@ -4191,9 +4209,8 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
 
 @app.post("/api/manual-import/gpx")
 async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...)):
+    _require_gpx_admin(request)
     _require_csrf(request, csrf_token)
-    if not _is_admin(request):
-        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
     bundles = await _read_gpx_bundles(files)
     data = await asyncio.get_running_loop().run_in_executor(
         GPX_IMPORT_POOL, _process_gpx_import, request, bundles, len(files), True, None,
@@ -4223,9 +4240,8 @@ async def _run_gpx_import_job(job_id, request, bundles, files_received):
 
 @app.post("/api/manual-import/gpx/start")
 async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...)):
+    _require_gpx_admin(request)
     _require_csrf(request, csrf_token)
-    if not _is_admin(request):
-        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
     bundles = await _read_gpx_bundles(files)
     if sum(job["status"] == "running" for job in GPX_IMPORT_JOBS.values()) >= 8:
         raise HTTPException(status_code=429, detail="Coda import piena: attendi il completamento dei caricamenti in corso")
@@ -4247,8 +4263,7 @@ async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), fi
 
 @app.get("/api/manual-import/jobs/{job_id}")
 def api_gpx_import_status(job_id: str, request: Request):
-    if not _is_admin(request):
-        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    _require_gpx_admin(request)
     job = GPX_IMPORT_JOBS.get(job_id)
     if not job or job["_owner"] != request.session.get("csrf_token"):
         raise HTTPException(status_code=404, detail="Import non trovato per questa sessione; verifica i percorsi già salvati e riprova i file mancanti")

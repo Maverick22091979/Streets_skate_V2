@@ -99,7 +99,7 @@ Parsing, arricchimento e salvataggio avvengono in un worker dedicato, con un sol
 
 Il reverse proxy deve accettare almeno 25 MB (`client_max_body_size 25m` su nginx, come nell'esempio in `docker/nginx/default.conf`). Il nginx installato sull'host va configurato separatamente.
 
-I job manuali sono riservati alla sessione admin che li ha avviati e restano in memoria nel processo web. Un riavvio interrompe i job in corso: verificare i percorsi salvati prima di ripetere il caricamento. I filename già importati vengono scartati. Applicare insieme frontend e backend aggiornati; in produzione ricostruire il servizio web, poi ricaricare il browser con Ctrl+F5.
+I job manuali sono riservati alla sessione admin che li ha avviati e restano in memoria nel processo web. L'inattività non fa scadere una sessione admin con un proprio job ancora attivo; questa protezione non si applica ad altri utenti o a job già terminati. Una sessione assente/scaduta restituisce HTTP 401 con richiesta di nuovo login; un utente autenticato senza ruolo admin riceve HTTP 403. Un riavvio interrompe i job in corso: verificare i percorsi salvati prima di ripetere il caricamento. I filename già importati vengono scartati. Applicare insieme frontend e backend aggiornati; in produzione ricostruire il servizio web, poi ricaricare il browser con Ctrl+F5.
 
 ## Variabili chiave
 

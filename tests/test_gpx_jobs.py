@@ -18,9 +18,9 @@ from app.db import Base
 from app.main import (
     GPX_IMPORT_JOBS, GPX_IMPORT_TASKS, _import_gpx_bundles, _read_gpx_bundles,
     api_gpx_import_status, api_import_gpx_start,
-    app, APP_SECRET_KEY, SESSION_COOKIE_NAME,
+    app, APP_SECRET_KEY, SESSION_COOKIE_NAME, _require_gpx_admin,
 )
-from app.models import Route
+from app.models import AuditLog, Route
 
 
 def request(token="test", admin=True):
@@ -104,7 +104,7 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await client.get(url)).json()["status"], "done")
 
     async def test_start_requires_admin_and_csrf(self):
-        for req, token, code in [(request(admin=False), "test", 403), (request(), "wrong", 403)]:
+        for req, token, code in [(request(admin=False), "test", 401), (request(), "wrong", 403)]:
             with self.assertRaises(HTTPException) as exc:
                 await api_import_gpx_start(req, csrf_token=token, files=[upload()])
             self.assertEqual(exc.exception.status_code, code)
@@ -117,10 +117,77 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_is_private_to_the_admin_session(self):
         GPX_IMPORT_JOBS["job"] = {"status": "running", "_owner": "test"}
-        for req, code in [(request("other"), 404), (request(admin=False), 403)]:
+        for req, code in [(request("other"), 404), (request(admin=False), 401)]:
             with self.assertRaises(HTTPException) as exc:
                 api_gpx_import_status("job", req)
             self.assertEqual(exc.exception.status_code, code)
+
+    async def test_active_job_prevents_inactivity_expiry_only_for_its_admin_session(self):
+        GPX_IMPORT_JOBS["active"] = {"status": "running", "_owner": "test"}
+        req = request()
+        req.session["session_last_seen_at"] = time.time() - 3600
+        with patch("app.main.SESSION_INACTIVITY_TIMEOUT_SEC", 60):
+            _require_gpx_admin(req)
+            self.assertIn("local_admin", req.session)
+            self.assertLess(time.time() - req.session["session_last_seen_at"], 1)
+            GPX_IMPORT_JOBS["active"]["status"] = "done"
+            req.session["session_last_seen_at"] = time.time() - 3600
+            with patch("app.main._log_session_timeout"):
+                with self.assertRaises(HTTPException) as exc:
+                    _require_gpx_admin(req)
+            self.assertEqual(exc.exception.status_code, 401)
+
+    async def test_other_admin_job_does_not_extend_an_expired_session(self):
+        GPX_IMPORT_JOBS["other"] = {"status": "running", "_owner": "other"}
+        req = request()
+        req.session["session_last_seen_at"] = time.time() - 3600
+        with patch("app.main.SESSION_INACTIVITY_TIMEOUT_SEC", 60), patch("app.main._log_session_timeout"):
+            with self.assertRaises(HTTPException) as exc:
+                _require_gpx_admin(req)
+        self.assertEqual(exc.exception.status_code, 401)
+
+    async def test_authenticated_non_admin_cannot_reuse_an_active_admin_job(self):
+        GPX_IMPORT_JOBS["active"] = {"status": "running", "_owner": "test"}
+        req = request(admin=False)
+        req.session.update(user_id=7, connection_id=9)
+        with self.assertRaises(HTTPException) as exc:
+            _require_gpx_admin(req)
+        self.assertEqual(exc.exception.status_code, 403)
+
+    async def test_http_distinguishes_invalid_cookie_from_authenticated_non_admin(self):
+        session = dict(request(admin=False).session, user_id=7, connection_id=9)
+        payload = base64.b64encode(json.dumps(session).encode())
+        cookies = [
+            (TimestampSigner("old-key-before-deploy").sign(payload).decode(), 401),
+            (TimestampSigner(APP_SECRET_KEY).sign(payload).decode(), 403),
+        ]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            for cookie, code in cookies:
+                res = await client.post(
+                    "/api/manual-import/gpx/start", data={"csrf_token": "test"},
+                    files={"files": ("test.gpx", b"<gpx/>")},
+                    headers={"Cookie": f"{SESSION_COOKIE_NAME}={cookie}"},
+                )
+                self.assertEqual(res.status_code, code)
+                self.assertIn("admin", res.json()["detail"])
+
+    async def test_expired_session_logs_once_without_reentering_authentication(self):
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        req = request()
+        req.session["session_last_seen_at"] = time.time() - 3600
+        with patch("app.main.SessionLocal", side_effect=lambda: Session(engine)), \
+             patch("app.main.SESSION_INACTIVITY_TIMEOUT_SEC", 60):
+            with self.assertRaises(HTTPException) as exc:
+                _require_gpx_admin(req)
+        self.assertEqual(exc.exception.status_code, 401)
+        self.assertEqual(req.session, {})
+        with Session(engine) as db:
+            logs = list(db.scalars(select(AuditLog)))
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].action, "session_timeout")
+            self.assertEqual(logs[0].actor_role, "Admin")
+        engine.dispose()
 
     async def test_json_only_and_oversized_uploads_are_rejected(self):
         with self.assertRaises(HTTPException) as exc:
