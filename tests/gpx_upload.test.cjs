@@ -16,6 +16,7 @@ function setup(fetch) {
   let refreshes = 0;
   const ctx = {
     window: {
+      crypto: { randomUUID: () => 'test-import-id' },
       sessionGuard: { beginTask: () => { holds += 1; return () => { holds -= 1; }; } },
       setTimeout: (fn, ms) => ms === 30000 ? null : setImmediate(fn),
       clearTimeout() {},
@@ -76,6 +77,86 @@ test('blocks respect count and byte limits and keep matching JSON with its GPX',
   const batches = ctx.gpxBatches([pair, large, groups[0]]);
   assert.deepEqual(Array.from(batches, (b) => b.length), [1, 1, 1]);
   assert.equal(batches[0][0], pair);
+});
+
+test('planning splits 450 routes into 90 blocks and 12 groups of at most eight blocks', () => {
+  const { ctx } = setup();
+  const files = Array.from({ length: 450 }, (_, i) => ({ name: `${i}.gpx`, size: 100 }));
+  const plan = ctx.gpxPlan(ctx.gpxGroups(files));
+  assert.equal(plan.batches.length, 90);
+  assert.equal(plan.sessions.length, 12);
+  assert.ok(plan.sessions.every((s) => s.blocks <= 8 && s.routes <= 40));
+  assert.equal(plan.sessions[11].blocks, 2);
+  assert.equal(plan.sessions[11].routes, 10);
+});
+
+test('large files increase the real block count and JSON files are not counted as routes', () => {
+  const { ctx } = setup();
+  const files = Array.from({ length: 9 }, (_, i) => [
+    { name: `${i}.gpx`, size: 3 * 1024 * 1024 }, { name: `${i}.json`, size: 10 },
+  ]).flat();
+  const plan = ctx.gpxPlan(ctx.gpxGroups(files));
+  assert.equal(plan.batches.length, 9);
+  assert.equal(plan.sessions.length, 2);
+  assert.equal(plan.sessions[1].routes, 1);
+});
+
+test('queue rejection retries the same upload id and respects Retry-After', async () => {
+  const ids = [];
+  const waits = [];
+  const env = setup(async (url, opts) => {
+    ids.push(opts.headers['X-Import-Id']);
+    return ids.length === 1
+      ? { ...response(429, { detail: 'Coda piena' }), headers: { get: () => '7' } }
+      : response(202, { job_id: 'accepted' });
+  });
+  const data = await env.ctx.startGpxImport({}, (ms) => waits.push(ms));
+  assert.equal(data.job_id, 'accepted');
+  assert.deepEqual(ids, ['test-import-id', 'test-import-id']);
+  assert.deepEqual(waits, [7000]);
+});
+
+test('an upload gateway timeout retries with the same id to avoid a second job', async () => {
+  const ids = [];
+  const env = setup(async (url, opts) => {
+    ids.push(opts.headers['X-Import-Id']);
+    return ids.length === 1 ? response(504, '<html>Timeout</html>') : response(202, { job_id: 'original-job' });
+  });
+  const data = await env.ctx.startGpxImport({}, () => {});
+  assert.equal(data.job_id, 'original-job');
+  assert.deepEqual(ids, ['test-import-id', 'test-import-id']);
+});
+
+test('groups run sequentially with a pause after eight completed blocks and show percentages', async () => {
+  let starts = 0;
+  let completed = 0;
+  let pauses = 0;
+  const labels = [];
+  const env = setup(async (url) => {
+    if (url.endsWith('/start')) {
+      assert.equal(starts, completed);
+      starts++;
+      return response(202, { job_id: String(starts) });
+    }
+    completed++;
+    return response(200, { status: 'done', result: { imported: completed === 9 ? 1 : 5 } });
+  });
+  env.ctx.gpxFiles.files = Array.from({ length: 41 }, (_, i) => ({ name: `${i}.gpx`, size: 100 }));
+  env.ctx.setGpxProgress = (done, total, label) => labels.push(label);
+  env.ctx.window.setTimeout = (fn, ms) => {
+    if (ms === 30000) return null;
+    if (ms === 5000) {
+      pauses++;
+      assert.equal(completed, 8);
+      assert.equal(env.holds, 1);
+    }
+    return setImmediate(fn);
+  };
+  await env.ctx.uploadGpx();
+  assert.equal(starts, 9);
+  assert.equal(pauses, 1);
+  assert.ok(labels.some((label) => /Gruppo 2\/2: 100%.*Blocco 9\/9: 100%/.test(label)));
+  assert.match(env.ctx.gpxUploadState.textContent, /Import completato: 41 percorsi/);
 });
 
 test('a transient polling timeout is retried without re-uploading files', async () => {

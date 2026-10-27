@@ -114,6 +114,37 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as exc:
             await api_import_gpx_start(request(), csrf_token="test", files=[upload()])
         self.assertEqual(exc.exception.status_code, 429)
+        self.assertEqual(exc.exception.headers["Retry-After"], "10")
+
+    async def test_start_rejects_more_than_five_routes_in_one_block(self):
+        with self.assertRaises(HTTPException) as exc:
+            await api_import_gpx_start(request(), csrf_token="test", files=[upload(f"{i}.gpx") for i in range(6)])
+        self.assertEqual(exc.exception.status_code, 413)
+        self.assertEqual(GPX_IMPORT_JOBS, {})
+
+    async def test_repeated_upload_id_reuses_job_even_when_queue_is_full(self):
+        req = request()
+        req.scope["headers"] = [(b"x-import-id", b"block-1")]
+        with patch("app.main._run_gpx_import_job", new=AsyncMock()) as run:
+            first = await api_import_gpx_start(req, csrf_token="test", files=[upload()])
+            jid = json.loads(first.body)["job_id"]
+            GPX_IMPORT_JOBS[jid]["status"] = "done"
+            GPX_IMPORT_JOBS.update({str(i): {"status": "running"} for i in range(8)})
+            again = await api_import_gpx_start(req, csrf_token="test", files=[upload()])
+            self.assertEqual(json.loads(again.body)["job_id"], jid)
+            await asyncio.gather(*GPX_IMPORT_TASKS)
+            run.assert_awaited_once()
+
+    async def test_upload_id_is_private_to_its_admin_session(self):
+        with patch("app.main._run_gpx_import_job", new=AsyncMock()):
+            ids = []
+            for owner in ["first", "second"]:
+                req = request(owner)
+                req.scope["headers"] = [(b"x-import-id", b"same-block-id")]
+                res = await api_import_gpx_start(req, csrf_token=owner, files=[upload()])
+                ids.append(json.loads(res.body)["job_id"])
+            self.assertNotEqual(*ids)
+            await asyncio.gather(*GPX_IMPORT_TASKS)
 
     async def test_status_is_private_to_the_admin_session(self):
         GPX_IMPORT_JOBS["job"] = {"status": "running", "_owner": "test"}

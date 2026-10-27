@@ -809,6 +809,60 @@ function gpxBatches(groups, maxCount = 5, maxBytes = 4 * 1024 * 1024) {
   return batches;
 }
 
+function gpxGroups(files) {
+  const bundles = new Map();
+  for (const file of files) {
+    const match = /^(.*)\.(gpx|json)$/i.exec(file.name || '');
+    if (!match) continue;
+    const group = bundles.get(match[1]) || [];
+    group.push(file);
+    bundles.set(match[1], group);
+  }
+  return [...bundles.values()].filter((group) => group.some((file) => /\.gpx$/i.test(file.name)));
+}
+
+function gpxPlan(groups) {
+  const batches = gpxBatches(groups);
+  const sessions = [];
+  for (let i = 0; i < batches.length; i += 8) {
+    const group = batches.slice(i, i + 8);
+    sessions.push({ first: i, blocks: group.length, routes: group.reduce((n, batch) => n + batch.length, 0) });
+  }
+  return { batches, sessions };
+}
+
+function importRetryDelay(response, attempt, maxDelay = 30000) {
+  const raw = response?.headers?.get('Retry-After');
+  if (raw) {
+    const ms = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
+    if (Number.isFinite(ms)) return Math.max(1000, ms);
+  }
+  return Math.min(maxDelay, 2000 * (attempt + 1));
+}
+
+async function startGpxImport(fd, onWait) {
+  const id = window.crypto.randomUUID();
+  for (let attempt = 0; ; attempt++) {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 30000);
+    let delay;
+    try {
+      const response = await fetch('/api/manual-import/gpx/start', {
+        method: 'POST', headers: { ...csrfHeaders(), 'X-Import-Id': id }, body: fd, signal: ctrl.signal,
+      });
+      if (![408, 429, 502, 503, 504, 522, 524].includes(response.status)) return await readImportResponse(response);
+      delay = importRetryDelay(response, attempt);
+    } catch (err) {
+      if (!(ctrl.signal.aborted || err.name === 'TypeError' || err.name === 'AbortError')) throw err;
+      delay = importRetryDelay(null, attempt);
+    } finally {
+      window.clearTimeout(timer);
+    }
+    onWait(delay);
+    await new Promise((resolve) => window.setTimeout(resolve, delay));
+  }
+}
+
 async function importJobStatus(id, onRetry = () => {}, path = '/api/manual-import/jobs/') {
   for (let attempt = 0; ; attempt += 1) {
     const ctrl = new AbortController();
@@ -816,14 +870,16 @@ async function importJobStatus(id, onRetry = () => {}, path = '/api/manual-impor
     try {
       const response = await fetch(`${path}${encodeURIComponent(id)}`, { cache: 'no-store', signal: ctrl.signal });
       if ([408, 429, 502, 503, 504, 522, 524].includes(response.status)) {
-        throw Object.assign(new Error(`HTTP ${response.status}: stato import temporaneamente non disponibile`), { retryable: true });
+        throw Object.assign(new Error(`HTTP ${response.status}: stato import temporaneamente non disponibile`), {
+          retryable: true, delay: importRetryDelay(response, attempt, 15000),
+        });
       }
       return await readImportResponse(response);
     } catch (err) {
       if (!(ctrl.signal.aborted || err.retryable || err.name === 'TypeError' || err.name === 'AbortError')) throw err;
       window.clearTimeout(timer);
       onRetry(attempt + 1);
-      await new Promise((resolve) => window.setTimeout(resolve, Math.min(15000, 2000 * (attempt + 1))));
+      await new Promise((resolve) => window.setTimeout(resolve, err.delay || Math.min(15000, 2000 * (attempt + 1))));
     } finally {
       window.clearTimeout(timer);
     }
@@ -839,15 +895,7 @@ async function uploadGpx(ev) {
     if (gpxUploadState) gpxUploadState.textContent = 'Seleziona almeno un file GPX o JSON';
     return;
   }
-  const bundles = new Map();
-  files.forEach((file) => {
-    const match = /^(.*)\.(gpx|json)$/i.exec(file.name || '');
-    if (!match) return;
-    const item = bundles.get(match[1]) || [];
-    item.push(file);
-    bundles.set(match[1], item);
-  });
-  const groups = [...bundles.values()].filter((group) => group.some((file) => /\.gpx$/i.test(file.name)));
+  const groups = gpxGroups(files);
   if (!groups.length) {
     const message = 'Nessun file GPX selezionato. Per l’export adidas apri Sport-sessions/GPS-data e seleziona i .gpx, con i .json omonimi opzionali. I JSON nella cartella Sport-sessions sono i dati descrittivi delle attività.';
     statusText.textContent = `Errore: ${message}`;
@@ -871,19 +919,41 @@ async function uploadGpx(ev) {
   let skippedShortNames = [];
   let skippedWrongTypeNames = [];
   let processedBundles = 0;
-  const batches = gpxBatches(groups);
+  const { batches, sessions } = gpxPlan(groups);
   statusText.textContent = `Import in corso: 0/${groups.length} percorsi`;
-  if (gpxUploadState) gpxUploadState.textContent = `Preparazione di ${groups.length} bundle GPX/JSON...`;
+  if (gpxUploadState) gpxUploadState.textContent = `${groups.length} percorsi, ${batches.length} blocchi, ${sessions.length} gruppi di massimo 8 blocchi.`;
   setGpxProgress(0, groups.length, `0 / ${groups.length} percorsi`);
+  let groupStart = 0;
   try {
-    for (const batch of batches) {
+    for (const [index, batch] of batches.entries()) {
+      const sessionIndex = Math.floor(index / 8);
+      const session = sessions[sessionIndex];
+      if (index % 8 === 0) {
+        groupStart = processedBundles;
+        if (index > 0) {
+          const message = `Gruppo ${sessionIndex}/${sessions.length} completato. Pausa di 5 secondi prima del prossimo gruppo...`;
+          statusText.textContent = message;
+          if (gpxUploadState) gpxUploadState.textContent = message;
+          await new Promise((resolve) => window.setTimeout(resolve, 5000));
+        }
+      }
+      const progress = (count) => {
+        const blockPct = Math.round(count / batch.length * 100);
+        const groupPct = Math.round((processedBundles - groupStart + count) / session.routes * 100);
+        setGpxProgress(processedBundles + count, groups.length,
+          `Gruppo ${sessionIndex + 1}/${sessions.length}: ${groupPct}% · Blocco ${index + 1}/${batches.length}: ${blockPct}% · Totale`);
+      };
+      progress(0);
       const fd = new FormData();
       fd.append('csrf_token', csrfToken);
       batch.flat().forEach((file) => fd.append('files', file));
       statusText.textContent = `Import in corso: ${processedBundles}/${groups.length} percorsi`;
       if (gpxUploadState) gpxUploadState.textContent = `Elaborazione percorsi ${processedBundles + 1}-${processedBundles + batch.length} di ${groups.length}`;
-      const response = await fetch('/api/manual-import/gpx/start', { method: 'POST', headers: csrfHeaders(), body: fd });
-      const start = await readImportResponse(response);
+      const start = await startGpxImport(fd, (delay) => {
+        const message = `Gruppo ${sessionIndex + 1}/${sessions.length}, blocco ${index + 1}/${batches.length}: server occupato, nuovo tentativo tra ${Math.ceil(delay / 1000)} secondi.`;
+        statusText.textContent = message;
+        if (gpxUploadState) gpxUploadState.textContent = message;
+      });
       if (!start.job_id) throw new Error('Il server non ha restituito un identificativo di import valido.');
       let job;
       do {
@@ -893,9 +963,10 @@ async function uploadGpx(ev) {
           statusText.textContent = message;
           if (gpxUploadState) gpxUploadState.textContent = message;
         });
-        const done = processedBundles + Math.min(batch.length, Number(job.done || 0));
+        const blockDone = job.status === 'done' ? batch.length : Math.max(0, Math.min(batch.length, Number(job.done) || 0));
+        const done = processedBundles + blockDone;
         statusText.textContent = `Import in corso: ${done}/${groups.length} percorsi`;
-        setGpxProgress(done, groups.length, `${done} / ${groups.length} percorsi`);
+        progress(blockDone);
         if (gpxUploadState && job.status === 'running') {
           gpxUploadState.textContent = job.phase === 'queued'
             ? `Blocco in attesa di elaborazione: ${done}/${groups.length} percorsi`
@@ -911,8 +982,8 @@ async function uploadGpx(ev) {
       skippedShortNames = skippedShortNames.concat(data.skipped_short_names || []);
       skippedWrongTypeNames = skippedWrongTypeNames.concat(data.skipped_wrong_type_names || []);
       totalCached = Number(data.total_cached || totalCached);
+      progress(batch.length);
       processedBundles += batch.length;
-      setGpxProgress(processedBundles, groups.length, `${processedBundles} / ${groups.length} percorsi`);
     }
     await loadRoutes();
     const shortMsg = shortSkipMessage(skippedShort, skippedShortNames);
@@ -1017,6 +1088,14 @@ if (saveProviderButtonsBtn) saveProviderButtonsBtn.addEventListener('click', sav
 if (resetFiltersBtn) resetFiltersBtn.addEventListener('click', resetFilters);
 if (gpxUploadForm) gpxUploadForm.addEventListener('submit', uploadGpx);
 if (uploadGpxBtn) uploadGpxBtn.addEventListener('click', uploadGpx);
+if (gpxFiles) gpxFiles.addEventListener('change', () => {
+  if (uploadGpxBtn.disabled || !gpxUploadState) return;
+  const groups = gpxGroups([...(gpxFiles.files || [])]);
+  const { batches, sessions } = gpxPlan(groups);
+  gpxUploadState.textContent = groups.length
+    ? `${groups.length} percorsi: ${batches.length} blocchi in ${sessions.length} gruppi di massimo 8 blocchi. Ogni blocco contiene fino a 5 percorsi; i file grandi possono richiedere più blocchi.`
+    : 'Seleziona almeno un file GPX, con il JSON omonimo opzionale.';
+});
 if (refreshAuditLogsBtn) refreshAuditLogsBtn.addEventListener('click', loadAuditLogs);
 if (dupDistanceDiffPct) dupDistanceDiffPct.addEventListener('input', () => { dupDistanceDiffPctValue.textContent = dupDistanceDiffPct.value; });
 if (dupEndpointToleranceM) dupEndpointToleranceM.addEventListener('input', () => { dupEndpointToleranceMValue.textContent = dupEndpointToleranceM.value; });

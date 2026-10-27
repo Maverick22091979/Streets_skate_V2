@@ -154,6 +154,8 @@ GPX_IMPORT_TASKS: set[asyncio.Task] = set()
 GPX_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpx-import")
 PROVIDER_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="provider-import")
 GPX_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+GPX_IMPORT_MAX_JOBS = 8
+GPX_IMPORT_BATCH_SIZE = 5
 FAILED_ADMIN_LOGINS: dict[str, dict[str, Any]] = {}
 IP_GEO_CACHE: dict[str, dict[str, Any]] = {}
 ALLOWED_GPX_SPORT_TYPES = {
@@ -4243,8 +4245,18 @@ async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), fi
     _require_gpx_admin(request)
     _require_csrf(request, csrf_token)
     bundles = await _read_gpx_bundles(files)
-    if sum(job["status"] == "running" for job in GPX_IMPORT_JOBS.values()) >= 8:
-        raise HTTPException(status_code=429, detail="Coda import piena: attendi il completamento dei caricamenti in corso")
+    if len(bundles) > GPX_IMPORT_BATCH_SIZE:
+        raise HTTPException(status_code=413, detail="Invia al massimo 5 percorsi per blocco")
+    request_id = request.headers.get("x-import-id", "")
+    if len(request_id) > 100:
+        raise HTTPException(status_code=400, detail="Identificativo import non valido")
+    owner = request.session.get("csrf_token")
+    if request_id:
+        for job in GPX_IMPORT_JOBS.values():
+            if job.get("_request_id") == request_id and job.get("_owner") == owner:
+                return JSONResponse({"job_id": job["job_id"], "status": job["status"]}, status_code=202)
+    if sum(job["status"] == "running" for job in GPX_IMPORT_JOBS.values()) >= GPX_IMPORT_MAX_JOBS:
+        raise HTTPException(status_code=429, detail="Coda import piena: attendi il completamento dei caricamenti in corso", headers={"Retry-After": "10"})
     now = time.time()
     for key, job in list(GPX_IMPORT_JOBS.items()):
         if job["status"] != "running" and now - job["created_at"] > 3600:
@@ -4253,6 +4265,7 @@ async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), fi
     GPX_IMPORT_JOBS[job_id] = {
         "job_id": job_id, "status": "running", "result": None, "error": None,
         "created_at": now, "_owner": request.session.get("csrf_token"),
+        "_request_id": request_id,
         "done": 0, "total": len(bundles), "imported": 0, "current": None, "phase": "queued",
     }
     task = asyncio.create_task(_run_gpx_import_job(job_id, request, bundles, len(files)))
