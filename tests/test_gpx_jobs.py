@@ -40,6 +40,11 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
         for task in list(GPX_IMPORT_TASKS):
             task.cancel()
         await asyncio.gather(*GPX_IMPORT_TASKS, return_exceptions=True)
+        import app.main as main
+        if main.GPX_COVERAGE_TASK:
+            main.GPX_COVERAGE_TASK.cancel()
+            await asyncio.gather(main.GPX_COVERAGE_TASK, return_exceptions=True)
+            main.GPX_COVERAGE_TASK = None
         GPX_IMPORT_JOBS.clear()
 
     async def test_upload_returns_before_enrichment_finishes_and_polls_to_completion(self):
@@ -115,6 +120,13 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
             await api_import_gpx_start(request(), csrf_token="test", files=[upload()])
         self.assertEqual(exc.exception.status_code, 429)
         self.assertEqual(exc.exception.headers["Retry-After"], "10")
+
+    async def test_byte_limited_queue_rejects_upload_before_retaining_its_files(self):
+        GPX_IMPORT_JOBS["large"] = {"status": "running", "_payload_bytes": 5}
+        with patch("app.main.GPX_IMPORT_MAX_QUEUED_BYTES", 10), self.assertRaises(HTTPException) as exc:
+            await api_import_gpx_start(request(), csrf_token="test", files=[upload(raw=b"123456")])
+        self.assertEqual(exc.exception.status_code, 429)
+        self.assertEqual(len(GPX_IMPORT_JOBS), 1)
 
     async def test_start_rejects_more_than_five_routes_in_one_block(self):
         with self.assertRaises(HTTPException) as exc:

@@ -151,11 +151,14 @@ PROVIDER_BUTTON_SETTINGS: dict[str, dict[str, bool]] = {
 IMPORT_JOBS: dict[str, dict[str, Any]] = {}
 GPX_IMPORT_JOBS: dict[str, dict[str, Any]] = {}
 GPX_IMPORT_TASKS: set[asyncio.Task] = set()
+GPX_COVERAGE_TASK: asyncio.Task | None = None
 GPX_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpx-import")
 PROVIDER_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="provider-import")
 GPX_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
-GPX_IMPORT_MAX_JOBS = 8
-GPX_IMPORT_BATCH_SIZE = 5
+GPX_IMPORT_MAX_JOBS = max(1, env_int("GPX_IMPORT_MAX_JOBS", 8))
+GPX_IMPORT_MAX_QUEUED_BYTES = max(1, env_int("GPX_IMPORT_MAX_QUEUED_MB", 32)) * 1024 * 1024
+GPX_IMPORT_BATCH_SIZE = max(1, env_int("GPX_IMPORT_BATCH_SIZE", 5))
+GPX_COVERAGE_IDLE_SEC = max(1, env_int("GPX_COVERAGE_IDLE_SEC", 15))
 FAILED_ADMIN_LOGINS: dict[str, dict[str, Any]] = {}
 IP_GEO_CACHE: dict[str, dict[str, Any]] = {}
 ALLOWED_GPX_SPORT_TYPES = {
@@ -3929,6 +3932,12 @@ def api_coverage_tracks(
 def api_coverage(request: Request, db: Session = Depends(get_db)):
     _require_coverage_access(request, db)
     try:
+        if _gpx_imports_running():
+            return JSONResponse(
+                {"status": "processing", "total_routes": db.scalar(select(func.count(Route.id))) or 0, "retry_after": 2},
+                status_code=202,
+                headers={"Cache-Control": "no-store", "Retry-After": "2"},
+            )
         data, status = _coverage_cache.get(db)
         headers = {"Cache-Control": "no-store"}
         if status == 202:
@@ -4128,6 +4137,40 @@ async def _read_gpx_bundles(files):
     return bundles
 
 
+def _gpx_bundle_bytes(bundles) -> int:
+    return sum(len(raw) for bundle in bundles.values() for _, raw in bundle.values())
+
+
+def _gpx_imports_running() -> bool:
+    return any(job.get("status") == "running" for job in GPX_IMPORT_JOBS.values())
+
+
+def _gpx_queued_bytes() -> int:
+    return sum(int(job.get("_payload_bytes", 0)) for job in GPX_IMPORT_JOBS.values() if job.get("status") == "running")
+
+
+def _cancel_gpx_coverage_refresh() -> None:
+    global GPX_COVERAGE_TASK
+    if GPX_COVERAGE_TASK and not GPX_COVERAGE_TASK.done():
+        GPX_COVERAGE_TASK.cancel()
+    GPX_COVERAGE_TASK = None
+
+
+async def _warm_coverage_after_gpx_idle() -> None:
+    try:
+        await asyncio.sleep(GPX_COVERAGE_IDLE_SEC)
+        if not _gpx_imports_running():
+            await asyncio.to_thread(_coverage_cache.warm)
+    except asyncio.CancelledError:
+        return
+
+
+def _schedule_gpx_coverage_refresh() -> None:
+    global GPX_COVERAGE_TASK
+    _cancel_gpx_coverage_refresh()
+    GPX_COVERAGE_TASK = asyncio.create_task(_warm_coverage_after_gpx_idle())
+
+
 async def _import_gpx_bundles(request, db, bundles, files_received, include_routes=True, progress=None):
     imported = 0
     skipped_filename = skipped_short = skipped_wrong_type = 0
@@ -4213,20 +4256,22 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
 async def api_import_gpx(request: Request, csrf_token: str = Form(...), files: list[UploadFile] = File(...)):
     _require_gpx_admin(request)
     _require_csrf(request, csrf_token)
+    _cancel_gpx_coverage_refresh()
     bundles = await _read_gpx_bundles(files)
     data = await asyncio.get_running_loop().run_in_executor(
         GPX_IMPORT_POOL, _process_gpx_import, request, bundles, len(files), True, None,
     )
+    if data["imported"]:
+        _schedule_gpx_coverage_refresh()
     request.session["session_last_seen_at"] = time.time()
     return JSONResponse(data)
 
 
 def _process_gpx_import(request, bundles, files_received, include_routes=False, progress=None):
-    try:
-        with SessionLocal() as db:
-            return asyncio.run(_import_gpx_bundles(request, db, bundles, files_received, include_routes, progress))
-    finally:
-        _coverage_cache.warm()
+    if progress is not None:
+        progress.update(phase="processing")
+    with SessionLocal() as db:
+        return asyncio.run(_import_gpx_bundles(request, db, bundles, files_received, include_routes, progress))
 
 
 async def _run_gpx_import_job(job_id, request, bundles, files_received):
@@ -4236,6 +4281,8 @@ async def _run_gpx_import_job(job_id, request, bundles, files_received):
             GPX_IMPORT_POOL, _process_gpx_import, request, bundles, files_received, False, job,
         )
         job.update(status="done", result=data, done=len(bundles), imported=data["imported"], current=None)
+        if data["imported"]:
+            _schedule_gpx_coverage_refresh()
     except Exception as exc:
         job.update(status="error", error=str(exc))
 
@@ -4255,17 +4302,21 @@ async def api_import_gpx_start(request: Request, csrf_token: str = Form(...), fi
         for job in GPX_IMPORT_JOBS.values():
             if job.get("_request_id") == request_id and job.get("_owner") == owner:
                 return JSONResponse({"job_id": job["job_id"], "status": job["status"]}, status_code=202)
-    if sum(job["status"] == "running" for job in GPX_IMPORT_JOBS.values()) >= GPX_IMPORT_MAX_JOBS:
+    _cancel_gpx_coverage_refresh()
+    queued = sum(job.get("status") == "running" for job in GPX_IMPORT_JOBS.values())
+    payload_bytes = _gpx_bundle_bytes(bundles)
+    if queued >= GPX_IMPORT_MAX_JOBS or _gpx_queued_bytes() + payload_bytes > GPX_IMPORT_MAX_QUEUED_BYTES:
         raise HTTPException(status_code=429, detail="Coda import piena: attendi il completamento dei caricamenti in corso", headers={"Retry-After": "10"})
     now = time.time()
     for key, job in list(GPX_IMPORT_JOBS.items()):
-        if job["status"] != "running" and now - job["created_at"] > 3600:
+        if job.get("status") != "running" and now - job.get("created_at", now) > 3600:
             GPX_IMPORT_JOBS.pop(key, None)
     job_id = uuid.uuid4().hex
     GPX_IMPORT_JOBS[job_id] = {
         "job_id": job_id, "status": "running", "result": None, "error": None,
         "created_at": now, "_owner": request.session.get("csrf_token"),
         "_request_id": request_id,
+        "_payload_bytes": payload_bytes,
         "done": 0, "total": len(bundles), "imported": 0, "current": None, "phase": "queued",
     }
     task = asyncio.create_task(_run_gpx_import_job(job_id, request, bundles, len(files)))

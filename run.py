@@ -24,6 +24,13 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
 if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))
@@ -40,5 +47,6 @@ if __name__ == "__main__":
         port=port,
         reload=reload_enabled,
         reload_dirs=["app"] if reload_enabled else None,
+        limit_concurrency=_env_int("UVICORN_LIMIT_CONCURRENCY", 40),
         log_config=log_config,
     )
