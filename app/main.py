@@ -76,6 +76,7 @@ SMTP_USERNAME = env_value("SMTP_USERNAME", "")
 SMTP_PASSWORD = env_value("SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = env_value("SMTP_FROM_EMAIL", "")
 SMTP_USE_TLS = env_bool("SMTP_USE_TLS", True)
+SMTP_USE_SSL = env_bool("SMTP_USE_SSL", SMTP_PORT == 465)
 STRIPE_SECRET_KEY = env_value("STRIPE_SECRET_KEY", "")
 STRIPE_PREMIUM_PRICE_ID = env_value("STRIPE_PREMIUM_PRICE_ID", env_value("STRIPE_SUPPORT_PRICE_ID", ""))
 PAYPAL_CLIENT_ID = env_value("PAYPAL_CLIENT_ID", "")
@@ -2689,6 +2690,21 @@ def _candidate_segment_points(route: Route, start_index: int | None, end_index: 
     return [dict(point) for point in points[start_index:end_index + 1]] if start_index is not None and end_index is not None and 0 <= start_index <= end_index else []
 
 
+def _send_candidate_review_email(candidate: OfficialSkateCandidate, route: Route) -> None:
+    if candidate.status != "needs_review" or candidate.review_email_sent_at or candidate.notification_attempts >= 3:
+        return
+    candidate.notification_attempts += 1
+    if not (SMTP_HOST and SMTP_FROM_EMAIL and OFFICIAL_ADMIN_EMAIL):
+        candidate.notification_error = "SMTP non configurato"
+        return
+    body = "\n".join(["È richiesta una verifica amministrativa per una pattinata candidata.", f"Percorso: {route.name or route.id}", f"Data/orario: {route.start_date_local or 'n.d.'}", f"Distanza: {route.distance_m or 0:.0f} m", f"Regole: {', '.join(candidate.reasons or [])}", f"Verifica: {BASE_URL}/admin/official-skates/{candidate.id}", "Il GPX personale completo non è allegato."])
+    try:
+        send_smtp_notification(SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_EMAIL, OFFICIAL_ADMIN_EMAIL, "Street Skate: verifica pattinata", body, SMTP_USE_TLS, SMTP_USE_SSL)
+        candidate.review_email_sent_at, candidate.notification_error = datetime.now(UTC), None
+    except Exception as exc:
+        candidate.notification_error = str(exc)
+
+
 def _evaluate_official_candidate(db: Session, route: Route) -> OfficialSkateCandidate | None:
     points = _route_points_from_enrichment(route.enrichment)
     if not points:
@@ -2707,6 +2723,8 @@ def _evaluate_official_candidate(db: Session, route: Route) -> OfficialSkateCand
     candidate.calendar_event_id = event.id if event else None
     candidate.status, candidate.reasons = result.state, result.reasons
     candidate.meeting_point_key, candidate.segment_start_index, candidate.segment_end_index = result.meeting_point_key, result.start_index, result.end_index
+    db.flush()
+    _send_candidate_review_email(candidate, route)
     return candidate
 
 

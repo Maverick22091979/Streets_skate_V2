@@ -14,14 +14,16 @@ def send_smtp_notification(
     subject: str,
     body: str,
     use_tls: bool = True,
+    use_ssl: bool = False,
 ) -> None:
     message = EmailMessage()
     message["From"] = sender
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
-    with smtplib.SMTP(host, port, timeout=20) as client:
-        if use_tls:
+    client_type = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    with client_type(host, port, timeout=20) as client:
+        if use_tls and not use_ssl:
             client.starttls()
         if username:
             client.login(username, password)
