@@ -2710,6 +2710,51 @@ def _evaluate_official_candidate(db: Session, route: Route) -> OfficialSkateCand
     return candidate
 
 
+def _publish_candidate(db: Session, candidate: OfficialSkateCandidate) -> OfficialSkateSegment | None:
+    if candidate.status != "approved" or not candidate.owner_publication_consent:
+        return None
+    points = _candidate_segment_points(candidate.route, candidate.segment_start_index, candidate.segment_end_index)
+    if len(points) < 2:
+        return None
+    segment = db.execute(select(OfficialSkateSegment).where(OfficialSkateSegment.candidate_id == candidate.id)).scalar_one_or_none()
+    if not segment:
+        segment = OfficialSkateSegment(candidate_id=candidate.id, route_id=candidate.route_id, points=[])
+        db.add(segment)
+    segment.public_name, segment.points, segment.published_at = candidate.route.name, points, datetime.now(UTC)
+    segment.distance_m = sum(_haversine_m((float(a["lat"]), float(a["lng"])), (float(b["lat"]), float(b["lng"]))) for a, b in zip(points, points[1:]))
+    segment.starts_at, segment.ends_at = parse_datetime(points[0].get("time")), parse_datetime(points[-1].get("time"))
+    return segment
+
+
+async def _sync_google_calendar(db: Session) -> dict[str, Any]:
+    if not GOOGLE_CALENDAR_API_KEY:
+        raise HTTPException(status_code=503, detail="GOOGLE_CALENDAR_API_KEY non configurata")
+    state = db.execute(select(CalendarSyncState).where(CalendarSyncState.calendar_id == GOOGLE_CALENDAR_ID)).scalar_one_or_none() or CalendarSyncState(calendar_id=GOOGLE_CALENDAR_ID)
+    db.add(state); db.flush()
+    params = {"key": GOOGLE_CALENDAR_API_KEY, "singleEvents": "true", "maxResults": "2500"}
+    if state.sync_token: params["syncToken"] = state.sync_token
+    else: params.update({"orderBy": "startTime", "timeMin": datetime.now(UTC).replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()})
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{quote(GOOGLE_CALENDAR_ID, safe='')}/events"
+    try:
+        async with httpx.AsyncClient(timeout=25) as client: payload = (await client.get(url, params=params)).raise_for_status().json()
+    except Exception as exc:
+        state.last_error = str(exc); db.commit(); raise HTTPException(status_code=502, detail="Sincronizzazione Google Calendar non riuscita") from exc
+    changed = 0
+    for item in payload.get("items", []):
+        event_id = str(item.get("id") or "")
+        if not event_id: continue
+        row = db.execute(select(CalendarEvent).where(CalendarEvent.calendar_id == GOOGLE_CALENDAR_ID, CalendarEvent.external_id == event_id)).scalar_one_or_none()
+        if item.get("status") == "cancelled":
+            if row: db.delete(row)
+            continue
+        if not row: row = CalendarEvent(calendar_id=GOOGLE_CALENDAR_ID, external_id=event_id); db.add(row)
+        row.title, row.description, row.location = item.get("summary"), item.get("description"), item.get("location")
+        row.start_at, row.end_at, row.raw_payload = parse_datetime((item.get("start") or {}).get("dateTime") or (item.get("start") or {}).get("date")), parse_datetime((item.get("end") or {}).get("dateTime") or (item.get("end") or {}).get("date")), item
+        changed += 1
+    state.sync_token, state.last_synced_at, state.last_error = payload.get("nextSyncToken") or state.sync_token, datetime.now(UTC), None
+    db.commit(); return {"changed": changed, "sync_token_available": bool(state.sync_token)}
+
+
 def _get_or_create_admin_entities(db: Session) -> tuple[User, AuthConnection]:
     stmt = select(AuthConnection).where(AuthConnection.provider == "manual", AuthConnection.provider_user_id == "local_admin")
     conn = db.execute(stmt).scalar_one_or_none()
@@ -3989,6 +4034,55 @@ def admin_update_route_type(route_id: int, request: Request, sport_type: str = F
         f"/admin/route-types?status={quote(f'Tipologia aggiornata per percorso {route.id}')}",
         status_code=303,
     )
+
+
+@app.get("/admin/official-skates", response_class=HTMLResponse)
+def admin_official_skates(request: Request, db: Session = Depends(get_db)):
+    if not _is_admin(request): return RedirectResponse("/dashboard", status_code=303)
+    candidates = list(db.execute(select(OfficialSkateCandidate).order_by(OfficialSkateCandidate.updated_at.desc())).scalars())
+    return templates.TemplateResponse("admin_official_skates.html", {"request": request, "app_name": APP_NAME, "asset_version": ASSET_VERSION, "candidates": candidates, "calendar_configured": bool(GOOGLE_CALENDAR_API_KEY), "status": request.query_params.get("status"), **_csrf_ctx(request)})
+
+
+@app.post("/api/admin/calendar/sync")
+async def api_admin_calendar_sync(request: Request, db: Session = Depends(get_db)):
+    _require_csrf(request)
+    if not _is_admin(request): raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    return JSONResponse(await _sync_google_calendar(db))
+
+
+@app.get("/admin/official-skates/{candidate_id}", response_class=HTMLResponse)
+def admin_official_skate_detail(candidate_id: int, request: Request, db: Session = Depends(get_db)):
+    if not _is_admin(request): return RedirectResponse("/dashboard", status_code=303)
+    candidate = db.get(OfficialSkateCandidate, candidate_id)
+    if not candidate: raise HTTPException(status_code=404, detail="Candidatura non trovata")
+    return templates.TemplateResponse("admin_official_skate_detail.html", {"request": request, "app_name": APP_NAME, "candidate": candidate, "route": _serialize_route(candidate.route, compact=False), "segment_points": _candidate_segment_points(candidate.route, candidate.segment_start_index, candidate.segment_end_index), **_csrf_ctx(request)})
+
+
+@app.post("/admin/official-skates/{candidate_id}/decision")
+def admin_official_skate_decision(candidate_id: int, request: Request, decision: str = Form(...), csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    _require_csrf(request, csrf_token)
+    if not _is_admin(request) or decision not in {"approved", "rejected"}: raise HTTPException(status_code=403, detail="Decisione non autorizzata")
+    candidate = db.get(OfficialSkateCandidate, candidate_id)
+    if not candidate: raise HTTPException(status_code=404, detail="Candidatura non trovata")
+    candidate.status = decision
+    db.add(OfficialSkateDecision(candidate_id=candidate.id, action=decision))
+    _publish_candidate(db, candidate); db.commit()
+    return RedirectResponse("/admin/official-skates", status_code=303)
+
+
+@app.post("/api/official-skates/{candidate_id}/consent")
+def api_official_skate_consent(candidate_id: int, request: Request, db: Session = Depends(get_db)):
+    _require_csrf(request)
+    candidate = db.get(OfficialSkateCandidate, candidate_id); user, _ = _get_session_user(request, db)
+    if not candidate or not user or candidate.owner_user_id != user.id: raise HTTPException(status_code=403, detail="Consenso riservato al proprietario")
+    candidate.owner_publication_consent = True; _publish_candidate(db, candidate); db.commit()
+    return JSONResponse({"consent": True, "published": candidate.status == "approved"})
+
+
+@app.get("/api/official-segments")
+def api_official_segments(db: Session = Depends(get_db)):
+    rows = list(db.execute(select(OfficialSkateSegment).where(OfficialSkateSegment.published_at.is_not(None))).scalars())
+    return JSONResponse({"segments": [{"id": r.id, "name": r.public_name, "distance_m": r.distance_m, "points": r.points} for r in rows]})
 
 
 @app.get("/coverage", response_class=HTMLResponse)
