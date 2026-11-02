@@ -32,7 +32,9 @@ from app.coverage import track_coords, track_lines
 from app.coverage_store import CoverageCache, route_geometry_query
 from app.db import Base, SessionLocal, engine, get_db
 from app.gpx_import import _declared_difficulty_from_filename, parse_gpx_bytes
-from app.models import AuditLog, AuthConnection, Payment, Route, User, UserRegistrationRequest
+from app.models import AuditLog, AuthConnection, CalendarEvent, CalendarSyncState, OfficialSkateCandidate, OfficialSkateDecision, OfficialSkateRule, OfficialSkateSegment, Payment, Route, User, UserRegistrationRequest, VerifiedSurfaceArea
+from app.notifications import send_smtp_notification
+from app.official_skates import DEFAULT_MEETING_POINTS, parse_datetime, recognize_official_segment
 from app.osm import fetch_surface_profile
 from app.providers import ProviderAdapter, build_provider_registry
 from app.slope import smooth_elevations, trend_metrics
@@ -64,6 +66,16 @@ RESEND_API_KEY = env_value("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = env_value("RESEND_FROM_EMAIL", "")
 RESEND_FROM_NAME = env_value("RESEND_FROM_NAME", "Street Skate")
 RESEND_REPLY_TO = env_value("RESEND_REPLY_TO", "")
+GOOGLE_CALENDAR_ID = env_value("GOOGLE_CALENDAR_ID", "1d7ff8f8bd79cd9297d9aa4be6e371cc085606329f87f9519e14dcc3a9b46e50@group.calendar.google.com")
+GOOGLE_CALENDAR_API_KEY = env_value("GOOGLE_CALENDAR_API_KEY", "")
+OFFICIAL_SEGMENT_TOLERANCE_M = env_float("OFFICIAL_SEGMENT_TOLERANCE_M", 30)
+OFFICIAL_ADMIN_EMAIL = env_value("OFFICIAL_ADMIN_EMAIL", "giorgio@barlattani.it")
+SMTP_HOST = env_value("SMTP_HOST", "")
+SMTP_PORT = env_int("SMTP_PORT", 587)
+SMTP_USERNAME = env_value("SMTP_USERNAME", "")
+SMTP_PASSWORD = env_value("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = env_value("SMTP_FROM_EMAIL", "")
+SMTP_USE_TLS = env_bool("SMTP_USE_TLS", True)
 STRIPE_SECRET_KEY = env_value("STRIPE_SECRET_KEY", "")
 STRIPE_PREMIUM_PRICE_ID = env_value("STRIPE_PREMIUM_PRICE_ID", env_value("STRIPE_SUPPORT_PRICE_ID", ""))
 PAYPAL_CLIENT_ID = env_value("PAYPAL_CLIENT_ID", "")
@@ -254,6 +266,7 @@ def startup() -> None:
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS geo_longitude DOUBLE PRECISION"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS geo_org VARCHAR(255)"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS geo_asn VARCHAR(64)"))
+    _seed_official_skate_rules()
     _coverage_cache.warm()
 
 
@@ -2430,6 +2443,7 @@ async def _enrich_route_data(db: Session | None, norm: dict[str, Any]) -> dict[s
             enrichment["dominant_smoothness"] = osm.get("dominant_smoothness")
             enrichment["has_cobblestone"] = bool(osm.get("has_cobblestone"))
             enrichment["surface_samples"] = osm.get("samples", [])
+            enrichment["surface_distances_m"] = osm.get("surface_distances_m", {})
             enrichment["track_alignment"] = osm.get("track_alignment")
             enrichment["surface_source"] = "overpass"
         except Exception:
@@ -2438,6 +2452,13 @@ async def _enrich_route_data(db: Session | None, norm: dict[str, Any]) -> dict[s
                 "status": "unavailable",
                 "summary": "Confronto rete OSM non disponibile",
             }
+    if db is not None:
+        verified_surfaces = _verified_surface_distances(db, profile_points)
+        if verified_surfaces:
+            enrichment["verified_surface_distances_m"] = verified_surfaces
+            enrichment["surface_source"] = "verified_database+overpass"
+            if any(name.lower() in {"cobblestone", "sett", "sampietrini"} for name in verified_surfaces):
+                enrichment["has_cobblestone"] = True
     if profile_points and (enrichment.get("temperature_c") is None or enrichment.get("atmospheric_pressure_hpa") is None):
         try:
             weather = await fetch_weather_snapshot(
@@ -2508,6 +2529,9 @@ def _store_routes(db: Session, user: User, conn: AuthConnection, items: list[dic
         route.difficulty = item["difficulty"]
         route.raw_payload = item["raw_payload"]
         saved.append(route)
+    db.commit()
+    for route in saved:
+        _evaluate_official_candidate(db, route)
     db.commit()
     if warm_coverage:
         _coverage_cache.warm()
@@ -2592,12 +2616,98 @@ def _is_admin(request: Request) -> bool:
     return bool(_get_local_admin(request))
 
 
+def _can_view_personal_route(request: Request, route: Route, db: Session) -> bool:
+    if _is_admin(request):
+        return True
+    user, _ = _get_session_user(request, db)
+    return bool(user and user.id == route.user_id)
+
+
 def _require_gpx_admin(request: Request) -> None:
     if _is_admin(request):
         return
     if not _has_authenticated_session(request):
         raise HTTPException(status_code=401, detail="Sessione scaduta o non valida. Accedi nuovamente con un account admin e riprova i file: quelli già salvati vengono riconosciuti.")
     raise HTTPException(status_code=403, detail="La sessione corrente non è admin. Esci e accedi con un account admin per importare i GPX.")
+
+
+def _seed_official_skate_rules() -> None:
+    db = SessionLocal()
+    try:
+        defaults = [("pre_2020", date(1900, 1, 1), date(2019, 12, 31), "san_carlo_al_corso", "21:30", None), ("covid", None, None, "piazzale_flaminio", "18:00", "20:00"), ("post_covid", None, None, "piazzale_flaminio", "21:00", None)]
+        for name, starts, ends, point, starts_at, ends_at in defaults:
+            if not db.execute(select(OfficialSkateRule.id).where(OfficialSkateRule.name == name)).scalar_one_or_none():
+                db.add(OfficialSkateRule(name=name, start_date=starts, end_date=ends, meeting_point_key=point, start_time=starts_at, end_time=ends_at))
+        if not db.execute(select(VerifiedSurfaceArea.id).where(VerifiedSurfaceArea.name == "Piazza del Popolo — delimitazione da verificare")).scalar_one_or_none():
+            db.add(VerifiedSurfaceArea(name="Piazza del Popolo — delimitazione da verificare", surface="unknown", polygon=[], is_verified=False, notes="Inserire un poligono verificato: nessuna pavimentazione viene dedotta per l'intera piazza."))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _official_rules(db: Session) -> list[dict[str, Any]]:
+    rows = list(db.execute(select(OfficialSkateRule).where(OfficialSkateRule.is_active.is_(True))).scalars())
+    rows.sort(key=lambda row: (row.start_date is None, row.id))
+    return [{"name": r.name, "start_date": r.start_date.isoformat() if r.start_date else None, "end_date": r.end_date.isoformat() if r.end_date else None, "meeting_point_key": r.meeting_point_key, "start_time": r.start_time, "end_time": r.end_time} for r in rows]
+
+
+def _point_in_surface_polygon(lat: float, lng: float, polygon: list[Any]) -> bool:
+    coords = [(float(item[0]), float(item[1])) for item in polygon if isinstance(item, (list, tuple)) and len(item) >= 2]
+    if len(coords) < 3:
+        return False
+    inside = False
+    for first, second in zip(coords, coords[1:] + coords[:1]):
+        if (first[0] > lat) != (second[0] > lat) and lng < (second[1] - first[1]) * (lat - first[0]) / (second[0] - first[0]) + first[1]:
+            inside = not inside
+    return inside
+
+
+def _verified_surface_distances(db: Session, points: list[dict[str, Any]]) -> dict[str, float]:
+    areas = list(db.execute(select(VerifiedSurfaceArea).where(VerifiedSurfaceArea.is_verified.is_(True))).scalars())
+    result: dict[str, float] = {}
+    for previous, current in zip(points, points[1:]):
+        if any(point.get(key) is None for point in (previous, current) for key in ("lat", "lng")):
+            continue
+        midpoint = ((float(previous["lat"]) + float(current["lat"])) / 2, (float(previous["lng"]) + float(current["lng"])) / 2)
+        area = next((item for item in areas if _point_in_surface_polygon(midpoint[0], midpoint[1], item.polygon or [])), None)
+        if area:
+            meters = _haversine_m((float(previous["lat"]), float(previous["lng"])), (float(current["lat"]), float(current["lng"])))
+            result[area.surface] = round(result.get(area.surface, 0) + meters, 1)
+    return result
+
+
+def _route_candidate_event(db: Session, route: Route) -> CalendarEvent | None:
+    starts = parse_datetime(route.start_date_local)
+    if not starts:
+        return None
+    events = [event for event in db.execute(select(CalendarEvent).where(CalendarEvent.start_at.is_not(None))).scalars() if event.start_at and event.start_at.astimezone().date() == starts.date()]
+    return min(events, key=lambda event: abs((event.start_at - starts).total_seconds())) if events else None
+
+
+def _candidate_segment_points(route: Route, start_index: int | None, end_index: int | None) -> list[dict[str, Any]]:
+    points = _route_points_from_enrichment(route.enrichment)
+    return [dict(point) for point in points[start_index:end_index + 1]] if start_index is not None and end_index is not None and 0 <= start_index <= end_index else []
+
+
+def _evaluate_official_candidate(db: Session, route: Route) -> OfficialSkateCandidate | None:
+    points = _route_points_from_enrichment(route.enrichment)
+    if not points:
+        return None
+    candidate = db.execute(select(OfficialSkateCandidate).where(OfficialSkateCandidate.route_id == route.id)).scalar_one_or_none()
+    if candidate and candidate.status in {"approved", "rejected"}:
+        return candidate
+    event = _route_candidate_event(db, route)
+    event_data = {"external_id": event.external_id, "start_at": event.start_at.isoformat() if event.start_at else None, "location": event.location} if event else None
+    result = recognize_official_segment(points, route.start_date_local, _official_rules(db), event_data, DEFAULT_MEETING_POINTS, OFFICIAL_SEGMENT_TOLERANCE_M)
+    if result.state == "personal":
+        return None
+    if not candidate:
+        candidate = OfficialSkateCandidate(route_id=route.id, owner_user_id=route.user_id)
+        db.add(candidate)
+    candidate.calendar_event_id = event.id if event else None
+    candidate.status, candidate.reasons = result.state, result.reasons
+    candidate.meeting_point_key, candidate.segment_start_index, candidate.segment_end_index = result.meeting_point_key, result.start_index, result.end_index
+    return candidate
 
 
 def _get_or_create_admin_entities(db: Session) -> tuple[User, AuthConnection]:
@@ -3961,6 +4071,8 @@ def route_detail(route_id: int, request: Request, db: Session = Depends(get_db))
     route = db.get(Route, route_id)
     if not route:
         raise HTTPException(status_code=404, detail="Percorso non trovato")
+    if not _can_view_personal_route(request, route, db):
+        raise HTTPException(status_code=403, detail="Non puoi accedere al percorso personale di un altro utente")
     return templates.TemplateResponse(
         "route_detail.html",
         {
@@ -3984,7 +4096,7 @@ def api_routes(request: Request, db: Session = Depends(get_db), after_id: int = 
         if not user or not conn:
             raise HTTPException(status_code=401, detail="Sessione non autenticata")
         provider = conn.provider
-    rows = _dashboard_routes(db, after_id, limit + 1 if limit is not None else None)
+    rows = _dashboard_routes(db, after_id, limit + 1 if limit is not None else None) if local_admin else [_serialize_route(route) for route in _user_routes(db, user.id) if route.id > after_id]
     routes = rows[:limit] if limit is not None else rows
     return JSONResponse({
         "routes": routes, "provider": provider,

@@ -10,5 +10,6 @@ __pycache__/
 *.py[cod]
 
 data/export/
+backups/
 com.runtastic.android-*.jadx
 *.apk

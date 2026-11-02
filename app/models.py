@@ -185,3 +185,114 @@ class AuditLog(Base):
     geo_asn: Mapped[str | None] = mapped_column(String(64))
     error: Mapped[str | None] = mapped_column(Text)
     meta: Mapped[dict | list | None] = mapped_column(JSON)
+
+
+class OfficialSkateRule(Base):
+    __tablename__ = "official_skate_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    meeting_point_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    start_time: Mapped[str | None] = mapped_column(String(8))
+    end_time: Mapped[str | None] = mapped_column(String(8))
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CalendarEvent(Base):
+    __tablename__ = "calendar_events"
+    __table_args__ = (UniqueConstraint("calendar_id", "external_id", name="uq_calendar_event_external"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    calendar_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(512))
+    description: Mapped[str | None] = mapped_column(Text)
+    location: Mapped[str | None] = mapped_column(String(512))
+    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_payload: Mapped[dict | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CalendarSyncState(Base):
+    __tablename__ = "calendar_sync_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    calendar_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    sync_token: Mapped[str | None] = mapped_column(Text)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class OfficialSkateCandidate(Base):
+    __tablename__ = "official_skate_candidates"
+    __table_args__ = (UniqueConstraint("route_id", name="uq_official_candidate_route"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    route_id: Mapped[int] = mapped_column(ForeignKey("routes.id", ondelete="CASCADE"), nullable=False)
+    owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    calendar_event_id: Mapped[int | None] = mapped_column(ForeignKey("calendar_events.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="needs_review")
+    reasons: Mapped[list | None] = mapped_column(JSON)
+    meeting_point_key: Mapped[str | None] = mapped_column(String(80))
+    segment_start_index: Mapped[int | None] = mapped_column(Integer)
+    segment_end_index: Mapped[int | None] = mapped_column(Integer)
+    owner_publication_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    review_email_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notification_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notification_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    route: Mapped["Route"] = relationship()
+    owner: Mapped["User"] = relationship(foreign_keys=[owner_user_id])
+    calendar_event: Mapped["CalendarEvent | None"] = relationship()
+
+
+class OfficialSkateSegment(Base):
+    __tablename__ = "official_skate_segments"
+    __table_args__ = (UniqueConstraint("candidate_id", name="uq_official_segment_candidate"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("official_skate_candidates.id", ondelete="CASCADE"), nullable=False)
+    route_id: Mapped[int] = mapped_column(ForeignKey("routes.id", ondelete="CASCADE"), nullable=False)
+    public_name: Mapped[str | None] = mapped_column(String(255))
+    points: Mapped[list] = mapped_column(JSON, nullable=False)
+    distance_m: Mapped[float | None] = mapped_column(Float)
+    starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    candidate: Mapped["OfficialSkateCandidate"] = relationship()
+
+
+class OfficialSkateDecision(Base):
+    __tablename__ = "official_skate_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("official_skate_candidates.id", ondelete="CASCADE"), nullable=False)
+    admin_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    old_start_index: Mapped[int | None] = mapped_column(Integer)
+    old_end_index: Mapped[int | None] = mapped_column(Integer)
+    new_start_index: Mapped[int | None] = mapped_column(Integer)
+    new_end_index: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class VerifiedSurfaceArea(Base):
+    __tablename__ = "verified_surface_areas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    surface: Mapped[str] = mapped_column(String(80), nullable=False)
+    polygon: Mapped[list] = mapped_column(JSON, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

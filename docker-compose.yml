@@ -45,6 +45,8 @@ services:
       GARMIN_CLIENT_SECRET_FILE: /run/secrets/garmin_client_secret
       INLINE_ROUTE_TRACKING_CLIENT_SECRET_FILE: /run/secrets/inline_route_tracking_client_secret
       ADIDAS_CLIENT_SECRET_FILE: /run/secrets/adidas_client_secret
+      GOOGLE_CALENDAR_API_KEY_FILE: /run/secrets/google_calendar_api_key
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
       BASE_URL: ${BASE_URL:-http://localhost:5000}
       HOST: 0.0.0.0
       PORT: 5000

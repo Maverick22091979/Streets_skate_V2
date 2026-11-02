@@ -74,15 +74,14 @@ def _declared_difficulty_from_filename(filename: str) -> dict[str, Any] | None:
     route_date = _extract_date_from_filename(filename)
     if route_date is None:
         return None
-    label = _declared_difficulty_from_date(route_date)
     return {
         "date": route_date.date().isoformat(),
         "weekday": route_date.strftime("%A"),
-        "level": label.level,
-        "color": label.color,
-        "score_min": label.score_min,
-        "score_max": label.score_max,
-        "source": label.source,
+        "level": "Unknown",
+        "color": "gray",
+        "score_min": 0,
+        "score_max": 100,
+        "source": "Data ricavata dal filename; difficoltà organizzatori non disponibile",
     }
 
 

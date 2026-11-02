@@ -222,10 +222,27 @@ async def fetch_surface_profile(
     else:
         alignment_status = "ok"
         alignment_summary = "Traccia coerente con la rete OSM campionata"
+    surface_distances: Counter[str] = Counter()
+    for previous, current in zip(points, points[1:]):
+        if any(item.get(key) is None for item in (previous, current) for key in ("lat", "lng")):
+            continue
+        start = (float(previous["lat"]), float(previous["lng"]))
+        end = (float(current["lat"]), float(current["lng"]))
+        distance_m = _haversine_m(start, end)
+        if distance_m <= 0:
+            continue
+        midpoint = {"lat": (start[0] + end[0]) / 2, "lng": (start[1] + end[1]) / 2}
+        matches = [(distance, way) for way in usable_ways if (distance := _way_distance_m(midpoint, way)) is not None]
+        nearest = min(matches, key=lambda item: item[0], default=None)
+        surface = "unknown"
+        if nearest and nearest[0] <= validation_radius_m:
+            surface = str(nearest[1].get("surface") or nearest[1].get("surface_fallback") or "unknown")
+        surface_distances[surface] += distance_m
     return {
         "dominant_surface": dominant,
         "dominant_smoothness": dominant_smoothness,
         "has_cobblestone": has_cobblestone,
+        "surface_distances_m": {name: round(value, 1) for name, value in surface_distances.items()},
         "samples": [
             {
                 "lat": way["lat"],
