@@ -14,6 +14,7 @@ from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo
 
 import httpx
 import stripe
@@ -70,6 +71,10 @@ GOOGLE_CALENDAR_ID = env_value("GOOGLE_CALENDAR_ID", "1d7ff8f8bd79cd9297d9aa4be6
 GOOGLE_CALENDAR_API_KEY = env_value("GOOGLE_CALENDAR_API_KEY", "")
 OFFICIAL_SEGMENT_TOLERANCE_M = env_float("OFFICIAL_SEGMENT_TOLERANCE_M", 30)
 OFFICIAL_ADMIN_EMAIL = env_value("OFFICIAL_ADMIN_EMAIL", "giorgio@barlattani.it")
+OFFICIAL_SHORT_SEGMENT_MAX_MINUTES = env_int("OFFICIAL_SHORT_SEGMENT_MAX_MINUTES", 20)
+OFFICIAL_SHORT_SEGMENT_MAX_DISTANCE_M = env_float("OFFICIAL_SHORT_SEGMENT_MAX_DISTANCE_M", 2000)
+OFFICIAL_CONTINUATION_MAX_GAP_MINUTES = env_int("OFFICIAL_CONTINUATION_MAX_GAP_MINUTES", 45)
+OFFICIAL_CONTINUATION_MAX_DISTANCE_M = env_float("OFFICIAL_CONTINUATION_MAX_DISTANCE_M", 250)
 SMTP_HOST = env_value("SMTP_HOST", "")
 SMTP_PORT = env_int("SMTP_PORT", 587)
 SMTP_USERNAME = env_value("SMTP_USERNAME", "")
@@ -2690,6 +2695,72 @@ def _candidate_segment_points(route: Route, start_index: int | None, end_index: 
     return [dict(point) for point in points[start_index:end_index + 1]] if start_index is not None and end_index is not None and 0 <= start_index <= end_index else []
 
 
+def _official_route_scope(candidate: OfficialSkateCandidate) -> dict[str, Any]:
+    points = _route_points_from_enrichment(candidate.route.enrichment)
+    first, last = candidate.segment_start_index, candidate.segment_end_index
+    if first is None or last is None or not 0 <= first <= last < len(points):
+        return {"available": False}
+    rome = ZoneInfo("Europe/Rome")
+
+    def local_time(point: dict[str, Any]) -> str | None:
+        instant = parse_datetime(point.get("time"))
+        return instant.astimezone(rome).strftime("%d/%m/%Y %H:%M") if instant else None
+
+    def distance_between(start: int, end: int) -> float:
+        start_m = points[start].get("cumulative_distance_m")
+        end_m = points[end].get("cumulative_distance_m")
+        if start_m is not None and end_m is not None and float(end_m) >= float(start_m):
+            return float(end_m) - float(start_m)
+        return sum(_haversine_m((float(a["lat"]), float(a["lng"])), (float(b["lat"]), float(b["lng"]))) for a, b in zip(points[start:end], points[start + 1:end + 1]) if all(p.get(k) is not None for p in (a, b) for k in ("lat", "lng")))
+
+    segment_m = distance_between(first, last)
+    full_m = distance_between(0, len(points) - 1)
+    return {
+        "available": True,
+        "segment_start": local_time(points[first]),
+        "segment_end": local_time(points[last]),
+        "route_start": local_time(points[0]),
+        "route_end": local_time(points[-1]),
+        "segment_km": round(segment_m / 1000, 1),
+        "route_km": round(full_m / 1000, 1),
+        "part_of_larger_route": first > 0 or last < len(points) - 1,
+        "before_km": round(distance_between(0, first) / 1000, 1),
+        "after_km": round(distance_between(last, len(points) - 1) / 1000, 1),
+    }
+
+
+def _possible_official_continuation(db: Session, candidate: OfficialSkateCandidate, segment_points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Find a likely second recording without merging or publishing personal GPS data."""
+    if len(segment_points) < 2:
+        return None
+    end_time = parse_datetime(segment_points[-1].get("time"))
+    start_time = parse_datetime(segment_points[0].get("time"))
+    if not end_time or not start_time or any(segment_points[-1].get(key) is None for key in ("lat", "lng")):
+        return None
+    distance_m = sum(_haversine_m((float(a["lat"]), float(a["lng"])), (float(b["lat"]), float(b["lng"]))) for a, b in zip(segment_points, segment_points[1:]) if all(point.get(key) is not None for point in (a, b) for key in ("lat", "lng")))
+    duration_minutes = (end_time - start_time).total_seconds() / 60
+    if duration_minutes > OFFICIAL_SHORT_SEGMENT_MAX_MINUTES and distance_m > OFFICIAL_SHORT_SEGMENT_MAX_DISTANCE_M:
+        return None
+    endpoint = (float(segment_points[-1]["lat"]), float(segment_points[-1]["lng"]))
+    max_end = end_time + timedelta(minutes=OFFICIAL_CONTINUATION_MAX_GAP_MINUTES)
+    matches: list[tuple[datetime, float, Route]] = []
+    routes = db.execute(select(Route).where(Route.user_id == candidate.owner_user_id, Route.id != candidate.route_id)).scalars()
+    for route in routes:
+        points = _route_points_from_enrichment(route.enrichment)
+        if not points or any(points[0].get(key) is None for key in ("lat", "lng")):
+            continue
+        route_start = parse_datetime(points[0].get("time")) or parse_datetime(route.start_date_local)
+        if not route_start or route_start < end_time or route_start > max_end:
+            continue
+        proximity_m = _haversine_m(endpoint, (float(points[0]["lat"]), float(points[0]["lng"])))
+        if proximity_m <= OFFICIAL_CONTINUATION_MAX_DISTANCE_M:
+            matches.append((route_start, proximity_m, route))
+    if not matches:
+        return {"checked": True, "found": False, "duration_minutes": round(duration_minutes), "distance_m": round(distance_m)}
+    route_start, proximity_m, route = min(matches, key=lambda item: (item[0], item[1]))
+    return {"checked": True, "found": True, "duration_minutes": round(duration_minutes), "distance_m": round(distance_m), "route_id": route.id, "route_name": route.name or f"Percorso {route.id}", "start_local": route_start.strftime("%d/%m/%Y, %H:%M:%S"), "gap_minutes": round((route_start - end_time).total_seconds() / 60, 1), "proximity_m": round(proximity_m), "route_distance_km": round((route.distance_m or 0) / 1000, 1)}
+
+
 def _send_candidate_review_email(candidate: OfficialSkateCandidate, route: Route) -> None:
     if candidate.status != "needs_review" or candidate.review_email_sent_at or candidate.notification_attempts >= 3:
         return
@@ -4058,7 +4129,8 @@ def admin_update_route_type(route_id: int, request: Request, sport_type: str = F
 def admin_official_skates(request: Request, db: Session = Depends(get_db)):
     if not _is_admin(request): return RedirectResponse("/dashboard", status_code=303)
     candidates = list(db.execute(select(OfficialSkateCandidate).order_by(OfficialSkateCandidate.updated_at.desc())).scalars())
-    return templates.TemplateResponse("admin_official_skates.html", {"request": request, "app_name": APP_NAME, "asset_version": ASSET_VERSION, "candidates": candidates, "calendar_configured": bool(GOOGLE_CALENDAR_API_KEY), "status": request.query_params.get("status"), **_csrf_ctx(request)})
+    scopes = {candidate.id: _official_route_scope(candidate) for candidate in candidates}
+    return templates.TemplateResponse("admin_official_skates.html", {"request": request, "app_name": APP_NAME, "asset_version": ASSET_VERSION, "candidates": candidates, "scopes": scopes, "calendar_configured": bool(GOOGLE_CALENDAR_API_KEY), "status": request.query_params.get("status"), **_csrf_ctx(request)})
 
 
 @app.post("/api/admin/calendar/sync")
@@ -4073,7 +4145,12 @@ def admin_official_skate_detail(candidate_id: int, request: Request, db: Session
     if not _is_admin(request): return RedirectResponse("/dashboard", status_code=303)
     candidate = db.get(OfficialSkateCandidate, candidate_id)
     if not candidate: raise HTTPException(status_code=404, detail="Candidatura non trovata")
-    return templates.TemplateResponse("admin_official_skate_detail.html", {"request": request, "app_name": APP_NAME, "candidate": candidate, "route": _serialize_route(candidate.route, compact=False), "segment_points": _candidate_segment_points(candidate.route, candidate.segment_start_index, candidate.segment_end_index), **_csrf_ctx(request)})
+    segment_points = _candidate_segment_points(candidate.route, candidate.segment_start_index, candidate.segment_end_index)
+    italy_tz = ZoneInfo("Europe/Rome")
+    segment_start = parse_datetime(segment_points[0].get("time")) if segment_points else None
+    segment_end = parse_datetime(segment_points[-1].get("time")) if segment_points else None
+    continuation = _possible_official_continuation(db, candidate, segment_points)
+    return templates.TemplateResponse("admin_official_skate_detail.html", {"request": request, "app_name": APP_NAME, "candidate": candidate, "route": _serialize_route(candidate.route, compact=False), "segment_points": segment_points, "segment_start_local": segment_start.astimezone(italy_tz).strftime("%d/%m/%Y, %H:%M:%S") if segment_start else None, "segment_end_local": segment_end.astimezone(italy_tz).strftime("%d/%m/%Y, %H:%M:%S") if segment_end else None, "scope": _official_route_scope(candidate), "continuation": continuation, **_csrf_ctx(request)})
 
 
 @app.post("/admin/official-skates/{candidate_id}/decision")

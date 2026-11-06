@@ -1,8 +1,61 @@
 <!doctype html>
-<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="csrf-token" content="{{ csrf_token }}"><title>Pattinate ufficiali - {{ app_name }}</title><link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}"></head>
-<body><main class="dashboard-page"><section class="dashboard-shell">
-  <div class="dashboard-header"><div><a class="back-link" href="/dashboard">Torna alla dashboard</a><h1>Pattinate ufficiali</h1><p>Le route personali non vengono pubblicate in questa pagina.</p></div></div>
-  <section class="admin-panel"><h2>Google Calendar</h2><p>{% if calendar_configured %}Calendario configurato.{% else %}Manca GOOGLE_CALENDAR_API_KEY.{% endif %}</p><button id="calendarSync" {% if not calendar_configured %}disabled{% endif %}>Sincronizza eventi</button><span id="calendarResult"></span></section>
-  {% if status %}<div class="notice">{{ status }}</div>{% endif %}
-  <section class="admin-panel"><h2>Candidature</h2><table class="admin-table"><thead><tr><th>ID</th><th>Percorso</th><th>Stato</th><th>Consenso</th><th>Motivazioni</th><th></th></tr></thead><tbody>{% for c in candidates %}<tr><td>{{ c.id }}</td><td>{{ c.route.name or c.route_id }}</td><td>{{ {'validated':'Validato','needs_review':'Da verificare','personal':'Personale','approved':'Approvato','rejected':'Rifiutato'}.get(c.status,c.status) }}</td><td>{{ "sì" if c.owner_publication_consent else "no" }}</td><td>{{ (c.reasons or [])|join("; ") }}</td><td><a href="/admin/official-skates/{{ c.id }}">Esamina</a></td></tr>{% else %}<tr><td colspan="6">Nessuna candidatura.</td></tr>{% endfor %}</tbody></table></section>
-</section></main><script src="/static/js/official_skates.js?v={{ asset_version }}"></script></body></html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Pattinate ufficiali - {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}-official-layout-2">
+</head>
+<body>
+  {% set labels = {'validated':'Validato','needs_review':'Da verificare','personal':'Personale','approved':'Approvato','rejected':'Rifiutato'} %}
+  {% set counters = namespace(review=0, approved=0, rejected=0, validated=0) %}
+  {% for c in candidates %}
+    {% if c.status == 'needs_review' %}{% set counters.review = counters.review + 1 %}{% endif %}
+    {% if c.status == 'approved' %}{% set counters.approved = counters.approved + 1 %}{% endif %}
+    {% if c.status == 'rejected' %}{% set counters.rejected = counters.rejected + 1 %}{% endif %}
+    {% if c.status == 'validated' %}{% set counters.validated = counters.validated + 1 %}{% endif %}
+  {% endfor %}
+  <main class="dashboard-page">
+    <section class="dashboard-shell official-skates-page">
+      <header class="dashboard-header official-page-header">
+        <div>
+          <a class="back-link" href="/dashboard">← Torna alla dashboard</a>
+          <h1>Pattinate ufficiali</h1>
+          <p>Valuta le proposte generate dai percorsi importati. I dati personali e il GPX completo non vengono pubblicati.</p>
+        </div>
+        <div class="official-total" aria-label="Candidature totali"><strong>{{ candidates|length }}</strong><span>candidature</span></div>
+      </header>
+      <section class="admin-panel calendar-panel">
+        <div><span class="panel-eyebrow">Fonte eventi</span><h2>Google Calendar</h2><p>{% if calendar_configured %}Calendario configurato e pronto per la sincronizzazione.{% else %}Manca GOOGLE_CALENDAR_API_KEY: aggiungila al file di configurazione per poter sincronizzare gli eventi.{% endif %}</p></div>
+        <div class="calendar-actions"><button id="calendarSync" {% if not calendar_configured %}disabled{% endif %}>Sincronizza eventi</button><span id="calendarResult" class="calendar-result" role="status" aria-live="polite"></span></div>
+      </section>
+      {% if status %}<div class="notice">{{ status }}</div>{% endif %}
+      <section class="official-summary" aria-label="Riepilogo candidature">
+        <div class="summary-card summary-review"><span>Da verificare</span><strong>{{ counters.review }}</strong></div>
+        <div class="summary-card summary-valid"><span>Validati automaticamente</span><strong>{{ counters.validated }}</strong></div>
+        <div class="summary-card summary-approved"><span>Approvati</span><strong>{{ counters.approved }}</strong></div>
+        <div class="summary-card summary-rejected"><span>Rifiutati</span><strong>{{ counters.rejected }}</strong></div>
+      </section>
+      <section class="admin-panel candidates-panel">
+        <div class="admin-panel-head candidates-panel-head"><div><span class="panel-eyebrow">Revisione amministrativa</span><h2>Candidature</h2><p>Apri una candidatura per controllare l'esito automatico e decidere se approvarla o rifiutarla.</p></div>{% if counters.review %}<span class="review-callout">{{ counters.review }} da esaminare</span>{% endif %}</div>
+        {% if candidates %}<div class="candidate-list">{% for c in candidates %}{% set scope = scopes[c.id] %}
+          <article class="candidate-card candidate-{{ c.status }}">
+            <div class="candidate-card-head"><div><span class="candidate-id">#{{ c.id }}</span><h3>{{ c.route.name or ('Percorso ' ~ c.route_id) }}</h3></div><span class="status-chip status-{{ c.status }}">{{ labels.get(c.status, c.status) }}</span></div>
+            <div class="candidate-fields">
+              <div class="candidate-field"><span>Tratto rilevato · ora italiana</span><strong>{% if scope.segment_start and scope.segment_end %}{{ scope.segment_start }} → {{ scope.segment_end }}{% else %}Orario non disponibile{% endif %}</strong><small>{% if scope.available %}{{ scope.segment_km }} km{% endif %}</small></div>
+              <div class="candidate-field"><span>Giro completo · ora italiana</span><strong>{% if scope.route_start and scope.route_end %}{{ scope.route_start }} → {{ scope.route_end }}{% else %}Orario non disponibile{% endif %}</strong><small>{% if scope.available %}{{ scope.route_km }} km{% elif c.route.distance_m %}{{ '%.1f'|format(c.route.distance_m / 1000) }} km{% endif %}</small></div>
+              <div class="candidate-field candidate-scope"><span>Rapporto col giro</span><strong>{% if not scope.available %}Tratto da verificare{% elif scope.part_of_larger_route %}Parte di un giro più ampio{% else %}Coincide con il giro{% endif %}</strong>{% if scope.part_of_larger_route %}<small>{{ scope.before_km }} km prima · {{ scope.after_km }} km dopo</small>{% endif %}</div>
+              <div class="candidate-field"><span>Calendario</span><strong>{% if c.calendar_event %}Evento collegato{% else %}Nessun evento collegato{% endif %}</strong></div>
+              <div class="candidate-field"><span>Esito rilevamento</span><strong>{{ (c.reasons or ['Nessuna motivazione disponibile'])|join('; ') }}</strong></div>
+              <div class="candidate-field candidate-consent {% if c.owner_publication_consent %}has-consent{% endif %}"><span>Consenso</span><strong>{% if c.owner_publication_consent %}Ricevuto{% else %}Non ricevuto{% endif %}</strong></div>
+            </div>
+            <div class="candidate-card-footer"><a class="candidate-action" href="/admin/official-skates/{{ c.id }}">Esamina <span aria-hidden="true">→</span></a></div>
+          </article>{% endfor %}</div>
+        {% else %}<div class="candidate-empty"><strong>Nessuna candidatura da mostrare.</strong><span>Le candidature vengono create quando viene importato un percorso idoneo alla verifica.</span></div>{% endif %}
+      </section>
+    </section>
+  </main>
+  <script src="/static/js/official_skates.js?v={{ asset_version }}"></script>
+</body>
+</html>
