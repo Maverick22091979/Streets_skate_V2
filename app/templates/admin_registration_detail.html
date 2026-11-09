@@ -44,7 +44,7 @@
           <div class="dup-card"><span>Nome</span><strong>{{ registration.first_name }}</strong></div>
           <div class="dup-card"><span>Cognome</span><strong>{{ registration.last_name }}</strong></div>
           <div class="dup-card"><span>Username</span><strong>{{ registration.username }}</strong></div>
-          <div class="dup-card"><span>Data di nascita</span><strong>{{ registration.birth_date or 'n.d.' }}</strong></div>
+          <div class="dup-card"><span>Data di nascita</span><strong>{{ registration.birth_date.split('-')|reverse|join('/') if registration.birth_date else 'n.d.' }}</strong></div>
           <div class="dup-card"><span>Email</span><strong>{{ registration.email }}</strong></div>
           <div class="dup-card"><span>Telefono</span><strong>{{ registration.phone }}</strong></div>
           <div class="dup-card"><span>Stato</span><strong>{{ registration.status_label }}</strong></div>

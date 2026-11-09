@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 import ipaddress
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -22,14 +23,14 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Re
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import case, cast, func, literal_column, select
+from sqlalchemy import and_, case, cast, func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import text
-from sqlalchemy.orm import Session, configure_mappers
+from sqlalchemy.orm import Session, configure_mappers, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import env_bool, env_float, env_int, env_value
-from app.coverage import track_coords, track_lines
+from app.coverage import build_coverage, track_coords, track_lines
 from app.coverage_store import CoverageCache, route_geometry_query
 from app.db import Base, SessionLocal, engine, get_db
 from app.gpx_import import _declared_difficulty_from_filename, parse_gpx_bytes
@@ -172,6 +173,8 @@ GPX_IMPORT_TASKS: set[asyncio.Task] = set()
 GPX_COVERAGE_TASK: asyncio.Task | None = None
 GPX_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpx-import")
 PROVIDER_IMPORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="provider-import")
+CALENDAR_HISTORY_JOB: dict[str, Any] = {"status": "idle"}
+CALENDAR_HISTORY_TASK: asyncio.Task | None = None
 GPX_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 GPX_IMPORT_MAX_JOBS = max(1, env_int("GPX_IMPORT_MAX_JOBS", 8))
 GPX_IMPORT_MAX_QUEUED_BYTES = max(1, env_int("GPX_IMPORT_MAX_QUEUED_MB", 32)) * 1024 * 1024
@@ -258,6 +261,8 @@ def startup() -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_user_registration_requests_username_pending_unique ON user_registration_requests (username) WHERE status = 'pending'"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_user_registration_requests_email_pending_unique ON user_registration_requests (email) WHERE status = 'pending'"))
         conn.execute(text("ALTER TABLE routes ADD COLUMN IF NOT EXISTS import_user_label VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE routes ADD COLUMN IF NOT EXISTS publication_approved BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE routes ADD COLUMN IF NOT EXISTS publication_consent BOOLEAN NOT NULL DEFAULT FALSE"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_ip VARCHAR(64)"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_method VARCHAR(16)"))
         conn.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_path VARCHAR(1024)"))
@@ -406,6 +411,7 @@ def _current_local_user(request: Request, db: Session) -> User | None:
 
 def _is_same_origin_request(request: Request) -> bool:
     target = request.url
+    public = urlparse(BASE_URL)
     for header_name in ("origin", "referer"):
         raw = request.headers.get(header_name)
         if not raw:
@@ -416,10 +422,10 @@ def _is_same_origin_request(request: Request) -> bool:
             continue
         if not src.scheme or not src.netloc:
             continue
-        return (
-            src.scheme.lower() == (target.scheme or "").lower()
-            and src.netloc.lower() == (target.netloc or "").lower()
-        )
+        origin = (src.scheme.lower(), src.netloc.lower())
+        direct = ((target.scheme or "").lower(), (target.netloc or "").lower())
+        configured = (public.scheme.lower(), public.netloc.lower())
+        return origin == direct or (bool(public.netloc) and direct[1] == configured[1] and origin == configured)
     return False
 
 
@@ -486,10 +492,12 @@ def _parse_birth_date(value: str) -> date | None:
     raw = (value or "").strip()
     if not raw:
         return None
-    try:
-        return datetime.strptime(raw, "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise ValueError("Data di nascita non valida") from exc
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError("Data di nascita non valida")
 
 
 def _generate_temporary_password(length: int = 14) -> str:
@@ -1214,10 +1222,10 @@ def _route_storage_source(route: Route) -> dict[str, str]:
     token_type = (route.connection.token_type or "").strip().lower() if route.connection else ""
     provider = (route.provider or "").strip().lower()
     if provider == "manual":
-        return {"kind": "local", "label": "DB locale", "detail": "Import manuale GPX/JSON"}
+        return {"kind": "local", "label": "Database", "detail": "Import manuale GPX/JSON"}
     if provider == "adidas" and token_type == "export":
-        return {"kind": "local", "label": "DB locale", "detail": "Export locale adidas"}
-    return {"kind": "live", "label": "DB live", "detail": f"OAuth/API {route.provider}"}
+        return {"kind": "local", "label": "Database", "detail": "Export adidas"}
+    return {"kind": "live", "label": "Database", "detail": f"OAuth/API {route.provider}"}
 
 
 def _user_import_consent_state(request: Request) -> str:
@@ -2569,7 +2577,11 @@ def _all_routes(db: Session) -> list[Route]:
     return list(db.execute(stmt).scalars())
 
 
-def _dashboard_routes(db: Session, after_id: int = 0, limit: int | None = None):
+def _visible_routes(user_id: int):
+    return or_(Route.user_id == user_id, and_(Route.publication_approved.is_(True), Route.publication_consent.is_(True)))
+
+
+def _dashboard_routes(db: Session, after_id: int = 0, limit: int | None = None, user_id: int | None = None):
     fields = [col for col in Route.__table__.columns if col.name not in {"enrichment", "raw_payload", "summary_polyline"}]
     if db.get_bind().dialect.name == "postgresql":
         compact = cast(Route.enrichment, JSONB)
@@ -2584,7 +2596,10 @@ def _dashboard_routes(db: Session, after_id: int = 0, limit: int | None = None):
         AuthConnection.token_type.label("_token_type"),
         Route.raw_payload["filename"].as_string().label("_filename"),
         compact.label("_compact"),
-    ).outerjoin(User, User.id == Route.user_id).outerjoin(AuthConnection, AuthConnection.id == Route.connection_id)
+        OfficialSkateCandidate.status.label("_official_status"),
+    ).outerjoin(User, User.id == Route.user_id).outerjoin(AuthConnection, AuthConnection.id == Route.connection_id).outerjoin(OfficialSkateCandidate, OfficialSkateCandidate.route_id == Route.id)
+    if user_id is not None:
+        stmt = stmt.where(_visible_routes(user_id))
     if limit is not None:
         stmt = stmt.where(Route.id > after_id).order_by(Route.id).limit(limit)
     else:
@@ -2592,6 +2607,7 @@ def _dashboard_routes(db: Session, after_id: int = 0, limit: int | None = None):
     routes = []
     for row in db.execute(stmt).mappings():
         data = dict(row)
+        official_status = data.pop("_official_status")
         enrichment = data.pop("_compact") or {}
         if isinstance(enrichment, str):
             enrichment = json.loads(enrichment)
@@ -2602,7 +2618,9 @@ def _dashboard_routes(db: Session, after_id: int = 0, limit: int | None = None):
             user=SimpleNamespace(display_name=data["_user_label"]),
             connection=SimpleNamespace(token_type=data["_token_type"]),
         )
-        routes.append(_serialize_route(route))
+        serialized = _serialize_route(route)
+        serialized["official_reviewed"] = official_status in {"approved", "rejected"}
+        routes.append(serialized)
     return routes
 
 
@@ -2626,7 +2644,27 @@ def _can_view_personal_route(request: Request, route: Route, db: Session) -> boo
     if _is_admin(request):
         return True
     user, _ = _get_session_user(request, db)
+    return bool(user and (user.id == route.user_id or (route.publication_approved and route.publication_consent)))
+
+
+def _is_route_owner(request: Request, route: Route, db: Session) -> bool:
+    admin = _get_local_admin(request)
+    if admin:
+        return _admin_owner_id(request, db) == route.user_id
+    user, _ = _get_session_user(request, db)
     return bool(user and user.id == route.user_id)
+
+
+def _admin_owner_id(request: Request, db: Session) -> int | None:
+    admin = _get_local_admin(request)
+    if not admin:
+        return None
+    user = _current_local_user(request, db)
+    if user:
+        return user.id
+    if admin.get("username") == ADMIN_USERNAME:
+        return db.scalar(select(AuthConnection.user_id).where(AuthConnection.provider == "manual", AuthConnection.provider_user_id == "local_admin"))
+    return None
 
 
 def _require_gpx_admin(request: Request) -> None:
@@ -2686,8 +2724,10 @@ def _route_candidate_event(db: Session, route: Route) -> CalendarEvent | None:
     starts = parse_datetime(route.start_date_local)
     if not starts:
         return None
-    events = [event for event in db.execute(select(CalendarEvent).where(CalendarEvent.start_at.is_not(None))).scalars() if event.start_at and event.start_at.astimezone().date() == starts.date()]
-    return min(events, key=lambda event: abs((event.start_at - starts).total_seconds())) if events else None
+    day_start = datetime.combine(starts.date(), datetime.min.time(), tzinfo=ZoneInfo("Europe/Rome"))
+    day_end = datetime.combine(starts.date() + timedelta(days=1), datetime.min.time(), tzinfo=ZoneInfo("Europe/Rome"))
+    events = list(db.execute(select(CalendarEvent).where(CalendarEvent.calendar_id == GOOGLE_CALENDAR_ID, CalendarEvent.start_at >= day_start, CalendarEvent.start_at < day_end)).scalars())
+    return min(events, key=lambda event: abs((parse_datetime(event.start_at) - starts).total_seconds())) if events else None
 
 
 def _candidate_segment_points(route: Route, start_index: int | None, end_index: int | None) -> list[dict[str, Any]]:
@@ -2776,7 +2816,7 @@ def _send_candidate_review_email(candidate: OfficialSkateCandidate, route: Route
         candidate.notification_error = str(exc)
 
 
-def _evaluate_official_candidate(db: Session, route: Route) -> OfficialSkateCandidate | None:
+def _evaluate_official_candidate(db: Session, route: Route, *, notify_review: bool = True) -> OfficialSkateCandidate | None:
     points = _route_points_from_enrichment(route.enrichment)
     if not points:
         return None
@@ -2795,7 +2835,8 @@ def _evaluate_official_candidate(db: Session, route: Route) -> OfficialSkateCand
     candidate.status, candidate.reasons = result.state, result.reasons
     candidate.meeting_point_key, candidate.segment_start_index, candidate.segment_end_index = result.meeting_point_key, result.start_index, result.end_index
     db.flush()
-    _send_candidate_review_email(candidate, route)
+    if notify_review:
+        _send_candidate_review_email(candidate, route)
     return candidate
 
 
@@ -2842,6 +2883,90 @@ async def _sync_google_calendar(db: Session) -> dict[str, Any]:
         changed += 1
     state.sync_token, state.last_synced_at, state.last_error = payload.get("nextSyncToken") or state.sync_token, datetime.now(UTC), None
     db.commit(); return {"changed": changed, "sync_token_available": bool(state.sync_token)}
+
+
+async def _fetch_calendar_year(year: int) -> list[dict[str, Any]]:
+    zone = ZoneInfo("Europe/Rome")
+    params = {"key": GOOGLE_CALENDAR_API_KEY, "singleEvents": "true", "showDeleted": "true", "maxResults": "2500",
+              "timeMin": datetime(year, 1, 1, tzinfo=zone).isoformat(),
+              "timeMax": datetime(year + 1, 1, 1, tzinfo=zone).isoformat()}
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{quote(GOOGLE_CALENDAR_ID, safe='')}/events"
+    items, seen_tokens = [], set()
+    async with httpx.AsyncClient(timeout=25) as client:
+        while True:
+            payload = (await client.get(url, params=params)).raise_for_status().json()
+            items.extend(payload.get("items", []))
+            token = payload.get("nextPageToken")
+            if not token:
+                return items
+            if token in seen_tokens:
+                raise ValueError("Google Calendar ha ripetuto una pagina")
+            seen_tokens.add(token)
+            params["pageToken"] = token
+
+
+def _run_calendar_history(job: dict[str, Any]) -> None:
+    try:
+        with SessionLocal() as db:
+            dates = list(db.execute(select(Route.id, Route.start_date_local)))
+        route_years: dict[int, list[int]] = {}
+        for route_id, start_date in dates:
+            start = parse_datetime(start_date)
+            if start:
+                route_years.setdefault(start.year, []).append(route_id)
+        if not route_years:
+            job.update(status="error", error="Nessun percorso con una data valida nel database")
+            return
+        current_year = datetime.now(ZoneInfo("Europe/Rome")).year
+        first_year = min(min(route_years), current_year)
+        job.update(first_year=first_year, last_year=current_year, total_years=current_year - first_year + 1)
+        for year in range(first_year, current_year + 1):
+            job["current_year"] = year
+            try:
+                items = asyncio.run(_fetch_calendar_year(year))
+                with SessionLocal() as db:
+                    changed = 0
+                    for item in items:
+                        event_id = str(item.get("id") or "")
+                        if not event_id:
+                            continue
+                        event = db.execute(select(CalendarEvent).where(CalendarEvent.calendar_id == GOOGLE_CALENDAR_ID, CalendarEvent.external_id == event_id)).scalar_one_or_none()
+                        if item.get("status") == "cancelled":
+                            if event:
+                                db.delete(event)
+                            continue
+                        if not event:
+                            event = CalendarEvent(calendar_id=GOOGLE_CALENDAR_ID, external_id=event_id)
+                            db.add(event)
+                            db.flush()
+                        event.title, event.description, event.location = item.get("summary"), item.get("description"), item.get("location")
+                        event.start_at = parse_datetime((item.get("start") or {}).get("dateTime") or (item.get("start") or {}).get("date"))
+                        event.end_at = parse_datetime((item.get("end") or {}).get("dateTime") or (item.get("end") or {}).get("date"))
+                        event.raw_payload = item
+                        changed += 1
+                    db.flush()
+                    checked = 0
+                    for route_id in route_years.get(year, []):
+                        route = db.get(Route, route_id)
+                        if route:
+                            _evaluate_official_candidate(db, route, notify_review=False)
+                            checked += 1
+                    state = db.execute(select(CalendarSyncState).where(CalendarSyncState.calendar_id == GOOGLE_CALENDAR_ID)).scalar_one_or_none()
+                    if not state:
+                        state = CalendarSyncState(calendar_id=GOOGLE_CALENDAR_ID)
+                        db.add(state)
+                    state.last_synced_at, state.last_error = datetime.now(UTC), None
+                    db.commit()
+                job["events_updated"] += changed
+                job["routes_checked"] += checked
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Sincronizzazione Calendar anno %s fallita: %s", year, type(exc).__name__)
+                job["failed_years"].append(year)
+            job["completed_years"] += 1
+        job.update(status="partial" if job["failed_years"] else "done", current_year=None)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Sincronizzazione Calendar interrotta: %s", type(exc).__name__)
+        job.update(status="error", error="Sincronizzazione interrotta; riprova e controlla i log del server")
 
 
 def _get_or_create_admin_entities(db: Session) -> tuple[User, AuthConnection]:
@@ -2974,7 +3099,7 @@ def _stored_route_filenames(db: Session) -> set[str]:
 
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         "login.html",
         {
             "request": request,
@@ -2989,6 +3114,8 @@ def root(request: Request):
             **_csrf_ctx(request),
         },
     )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -2998,7 +3125,7 @@ def login_page(request: Request):
 
 @app.get("/register", response_class=HTMLResponse)
 def register_page(request: Request):
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         "register.html",
         {
             "request": request,
@@ -3009,6 +3136,8 @@ def register_page(request: Request):
             **_csrf_ctx(request),
         },
     )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/register")
@@ -3677,6 +3806,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
                 "gpx_status": request.query_params.get("gpx_status"),
                 "initial_routes": routes,
                 "initial_users": _admin_route_users(db),
+                "personal_owner_id": _admin_owner_id(request, db),
                 **_csrf_ctx(request),
             },
         )
@@ -3691,7 +3821,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     ctx["import_autostart"] = bool(request.session.pop("import_autostart", False))
     ctx["can_change_password"] = bool(_current_local_user(request, db))
     ctx["support_available"] = True
-    routes = _dashboard_routes(db)
+    routes = _dashboard_routes(db, user_id=user.id)
     return templates.TemplateResponse(
         "dashboard.html",
         {
@@ -3701,11 +3831,32 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             "user": ctx,
             "gpx_status": request.query_params.get("gpx_status"),
             "initial_routes": routes,
-            "initial_users": _admin_route_users(db),
+            "initial_users": [{"id": str(uid), "label": label} for uid, label in {r["import_user_id"]: r["import_user_label"] or f'Utente {r["import_user_id"]}' for r in routes}.items()],
             "import_profile": _provider_import_profile(conn.provider, conn.token_type),
             **_csrf_ctx(request),
         },
     )
+
+
+@app.post("/admin/users/{user_id}/password")
+def admin_reset_user_password(user_id: int, request: Request, new_password: str = Form(...),
+                              confirm_password: str = Form(...), csrf_token: str = Form(...),
+                              db: Session = Depends(get_db)):
+    _require_csrf(request, csrf_token)
+    if not _is_admin(request) or _must_change_password(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    user = db.get(User, user_id)
+    if not user or not user.username or not user.password_hash:
+        raise HTTPException(status_code=404, detail="Account con password non trovato")
+    error = _password_policy_error(new_password)
+    if new_password != confirm_password:
+        error = "Le nuove password non coincidono"
+    if error:
+        return RedirectResponse(f"/admin/registrations?account_status={quote(error)}#utenti", status_code=303)
+    user.password_hash = _hash_password(new_password)
+    user.must_change_password = True
+    _write_audit_log(db, request, "admin_reset_user_password", meta={"target_user_id": user.id})
+    return RedirectResponse(f"/admin/registrations?account_status={quote('Password aggiornata; l’utente dovrà cambiarla al prossimo accesso')}#utenti", status_code=303)
 
 
 @app.get("/settings", response_class=HTMLResponse)
@@ -3828,6 +3979,8 @@ def admin_registrations(request: Request, state: str | None = None, db: Session 
                 "can_change_password": bool(_current_local_user(request, db)),
             },
             "rows": rows,
+            "accounts": list(db.execute(select(User).options(selectinload(User.connections)).order_by(User.id)).scalars()),
+            "account_status": request.query_params.get("account_status"),
             "status_filter": state or "",
             "pending_registration_count": _pending_registration_count(db),
             "status": request.query_params.get("message"),
@@ -4137,7 +4290,33 @@ def admin_official_skates(request: Request, db: Session = Depends(get_db)):
 async def api_admin_calendar_sync(request: Request, db: Session = Depends(get_db)):
     _require_csrf(request)
     if not _is_admin(request): raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    if CALENDAR_HISTORY_TASK and not CALENDAR_HISTORY_TASK.done():
+        raise HTTPException(status_code=409, detail="Sincronizzazione storica già in corso")
     return JSONResponse(await _sync_google_calendar(db))
+
+
+@app.post("/api/admin/calendar/history")
+async def api_admin_calendar_history_start(request: Request):
+    global CALENDAR_HISTORY_JOB, CALENDAR_HISTORY_TASK
+    _require_csrf(request)
+    if not _is_admin(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    if not GOOGLE_CALENDAR_API_KEY:
+        raise HTTPException(status_code=503, detail="GOOGLE_CALENDAR_API_KEY non configurata")
+    if CALENDAR_HISTORY_TASK and not CALENDAR_HISTORY_TASK.done():
+        return JSONResponse(CALENDAR_HISTORY_JOB, status_code=202)
+    CALENDAR_HISTORY_JOB = {"status": "running", "current_year": None, "total_years": 0,
+                            "completed_years": 0, "events_updated": 0, "routes_checked": 0,
+                            "failed_years": []}
+    CALENDAR_HISTORY_TASK = asyncio.create_task(asyncio.to_thread(_run_calendar_history, CALENDAR_HISTORY_JOB))
+    return JSONResponse(CALENDAR_HISTORY_JOB, status_code=202)
+
+
+@app.get("/api/admin/calendar/history")
+def api_admin_calendar_history_status(request: Request):
+    if not _is_admin(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    return JSONResponse(CALENDAR_HISTORY_JOB, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/admin/official-skates/{candidate_id}", response_class=HTMLResponse)
@@ -4216,7 +4395,11 @@ def api_coverage_tracks(
     db: Session = Depends(get_db),
 ):
     _require_coverage_access(request, db)
-    rows = list(db.execute(route_geometry_query().where(Route.id > after_id).limit(limit + 1)))
+    query = route_geometry_query().where(Route.id > after_id)
+    if not _get_local_admin(request):
+        user, _ = _get_session_user(request, db)
+        query = query.where(_visible_routes(user.id))
+    rows = list(db.execute(query.limit(limit + 1)))
     page = rows[:limit]
     lines = [line for _, pts, polyline in page for line in track_lines(track_coords(pts, polyline, _decode_polyline))]
     return JSONResponse({
@@ -4237,7 +4420,13 @@ def api_coverage(request: Request, db: Session = Depends(get_db)):
                 status_code=202,
                 headers={"Cache-Control": "no-store", "Retry-After": "2"},
             )
-        data, status = _coverage_cache.get(db)
+        if _get_local_admin(request):
+            data, status = _coverage_cache.get(db)
+        else:
+            user, _ = _get_session_user(request, db)
+            rows = db.execute(route_geometry_query().where(_visible_routes(user.id)))
+            data = build_coverage([track_coords(pts, line, _decode_polyline) for _, pts, line in rows])
+            status = 200
         headers = {"Cache-Control": "no-store"}
         if status == 202:
             headers["Retry-After"] = str(data["retry_after"])
@@ -4262,6 +4451,7 @@ def route_detail(route_id: int, request: Request, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail="Percorso non trovato")
     if not _can_view_personal_route(request, route, db):
         raise HTTPException(status_code=403, detail="Non puoi accedere al percorso personale di un altro utente")
+    candidate = db.execute(select(OfficialSkateCandidate).where(OfficialSkateCandidate.route_id == route.id)).scalar_one_or_none() if local_admin else None
     return templates.TemplateResponse(
         "route_detail.html",
         {
@@ -4270,10 +4460,84 @@ def route_detail(route_id: int, request: Request, db: Session = Depends(get_db))
             "asset_version": ASSET_VERSION,
             "user": user_ctx,
             "route": _serialize_route(route, compact=False),
+            "publication_approved": route.publication_approved,
+            "publication_consent": route.publication_consent,
+            "is_owner": _is_route_owner(request, route, db),
+            "official_candidate": candidate,
+            "publication_status": request.query_params.get("publication_status"),
             "viewer_settings": VIEWER_SETTINGS,
             **_csrf_ctx(request),
         },
     )
+
+
+@app.post("/routes/{route_id}/official-review")
+def route_official_review(route_id: int, request: Request, decision: str = Form(...), csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    _require_csrf(request, csrf_token)
+    if not _is_admin(request) or _must_change_password(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    if decision not in {"approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="Decisione non valida")
+    route = db.execute(select(Route).where(Route.id == route_id).with_for_update()).scalar_one_or_none()
+    if not route:
+        raise HTTPException(status_code=404, detail="Percorso non trovato")
+    candidate = db.execute(select(OfficialSkateCandidate).where(OfficialSkateCandidate.route_id == route_id)).scalar_one_or_none()
+    if candidate and candidate.status in {"approved", "rejected"}:
+        return RedirectResponse(f"/routes/{route_id}", status_code=303)
+    if not candidate:
+        candidate = OfficialSkateCandidate(route_id=route.id, owner_user_id=route.user_id, reasons=["Verifica manuale"])
+        db.add(candidate)
+        db.flush()
+    candidate.status = decision
+    db.add(OfficialSkateDecision(candidate_id=candidate.id, action=decision))
+    if decision == "approved":
+        _publish_candidate(db, candidate)
+    db.commit()
+    return RedirectResponse(f"/routes/{route_id}", status_code=303)
+
+
+@app.post("/routes/{route_id}/publication")
+def route_publication(route_id: int, request: Request, action: str = Form(...), csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    _require_csrf(request, csrf_token)
+    if _must_change_password(request):
+        raise HTTPException(status_code=403, detail="Cambio password richiesto")
+    route = db.get(Route, route_id)
+    if not route:
+        raise HTTPException(status_code=404, detail="Percorso non trovato")
+    if action in {"approve", "unapprove"} and _is_admin(request) and _is_route_owner(request, route, db):
+        route.publication_approved = action == "approve"
+        if action == "approve":
+            route.publication_consent = True
+    elif action in {"consent", "withdraw"}:
+        if not _is_route_owner(request, route, db):
+            raise HTTPException(status_code=403, detail="Consenso riservato al proprietario")
+        route.publication_consent = action == "consent"
+        route.publication_approved = action == "consent"
+    else:
+        raise HTTPException(status_code=403, detail="Operazione non autorizzata")
+    _write_audit_log(db, request, "route_publication_" + action, meta={"route_id": route.id})
+    return RedirectResponse(f"/routes/{route_id}?publication_status=aggiornato", status_code=303)
+
+
+@app.post("/api/admin/routes/publication")
+def admin_publish_routes(request: Request, route_ids: list[int] = Body(...), db: Session = Depends(get_db)):
+    _require_csrf(request)
+    if not _is_admin(request) or _must_change_password(request):
+        raise HTTPException(status_code=403, detail="Accesso admin richiesto")
+    ids = set(route_ids)
+    if not ids or len(ids) > 10000 or any(route_id <= 0 for route_id in ids):
+        raise HTTPException(status_code=400, detail="Selezione non valida")
+    owner_id = _admin_owner_id(request, db)
+    if owner_id is None:
+        raise HTTPException(status_code=403, detail="Nessun proprietario associato all'account")
+    routes = list(db.scalars(select(Route).where(Route.id.in_(ids))))
+    if len(routes) != len(ids) or any(route.user_id != owner_id for route in routes):
+        raise HTTPException(status_code=403, detail="Puoi abilitare solo i tuoi percorsi")
+    for route in routes:
+        route.publication_approved = True
+        route.publication_consent = True
+    _write_audit_log(db, request, "route_publication_bulk", meta={"route_ids": sorted(ids), "count": len(ids)})
+    return JSONResponse({"published": len(ids)})
 
 
 @app.get("/api/routes")
@@ -4285,11 +4549,11 @@ def api_routes(request: Request, db: Session = Depends(get_db), after_id: int = 
         if not user or not conn:
             raise HTTPException(status_code=401, detail="Sessione non autenticata")
         provider = conn.provider
-    rows = _dashboard_routes(db, after_id, limit + 1 if limit is not None else None) if local_admin else [_serialize_route(route) for route in _user_routes(db, user.id) if route.id > after_id]
+    rows = _dashboard_routes(db, after_id, limit + 1 if limit is not None else None, None if local_admin else user.id)
     routes = rows[:limit] if limit is not None else rows
     return JSONResponse({
         "routes": routes, "provider": provider,
-        "users": _admin_route_users(db) if after_id == 0 else [],
+        "users": (_admin_route_users(db) if local_admin else [{"id": str(uid), "label": label} for uid, label in {r["import_user_id"]: r["import_user_label"] or f'Utente {r["import_user_id"]}' for r in rows}.items()]) if after_id == 0 else [],
         "has_more": limit is not None and len(rows) > limit,
         "next_after": routes[-1]["id"] if routes else after_id,
     }, headers={"Cache-Control": "no-store"})
@@ -4308,7 +4572,7 @@ def api_delete_route(route_id: int, request: Request, db: Session = Depends(get_
     db.delete(route)
     db.commit()
     _coverage_cache.warm()
-    routes = [_serialize_route(r) for r in _all_routes(db)]
+    routes = _dashboard_routes(db)
     _write_audit_log(db, request, "delete_route", meta={"route_id": route_id, "route_name": route_name, "total_cached": len(routes)})
     payload: dict[str, Any] = {"deleted": route_id, "total_cached": len(routes), "routes": routes}
     payload["users"] = _admin_route_users(db)
@@ -4548,7 +4812,7 @@ async def _import_gpx_bundles(request, db, bundles, files_received, include_rout
             "skipped_wrong_type_names": skipped_wrong_type_names,
             "total_cached": total_cached,
             "provider": "manual",
-            "routes": [_serialize_route(r) for r in routes] if include_routes else None,
+            "routes": _dashboard_routes(db, user_id=user.id) if include_routes else None,
         }
     )
 
@@ -4655,7 +4919,7 @@ async def dashboard_import_gpx(request: Request, csrf_token: str = Form(...), fi
         msg = (
             f'Import completato: {body.get("imported", 0)} percorsi da {body.get("processed_bundles", 0)} bundle GPX/JSON, '
             f'scartati nome file={body.get("skipped_filename", 0)}{short_msg}{wrong_type_msg}, '
-            f'totale cache {body.get("total_cached", 0)}'
+            f'totale nel database {body.get("total_cached", 0)}'
         )
         return RedirectResponse(f"/dashboard?gpx_status={quote(msg)}", status_code=303)
     except Exception as exc:

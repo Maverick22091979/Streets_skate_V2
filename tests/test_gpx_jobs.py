@@ -257,7 +257,11 @@ class GpxJobTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result["routes"])
             result = await _import_gpx_bundles(request(), db, bundles, 1, include_routes=False)
             self.assertEqual(result["skipped_filename"], 1)
-            self.assertEqual(len(list(db.scalars(select(Route)))), 1)
+        with Session(engine) as db:
+            saved = list(db.scalars(select(Route)))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].raw_payload["filename"], "test.gpx")
+            self.assertEqual(len(saved[0].enrichment["point_profile"]["points"]), 2)
         engine.dispose()
 
     async def test_database_connection_is_released_during_parsing_and_enrichment(self):

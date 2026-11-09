@@ -103,7 +103,7 @@
                 <tr>
                   <td>{{ account.first_name or 'n.d.' }}</td>
                   <td>{{ account.last_name or 'n.d.' }}</td>
-                  <td>{{ account.birth_date or 'n.d.' }}</td>
+                  <td>{{ account.birth_date.split('-')|reverse|join('/') if account.birth_date else 'n.d.' }}</td>
                   <td>{{ account.username }}</td>
                   <td>{{ account.display_name }}</td>
                   <td>{{ account.email }}</td>

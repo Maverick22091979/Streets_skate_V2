@@ -43,7 +43,7 @@
         </label>
         <label>
           Data di nascita
-          <input type="date" name="birth_date" required>
+          <input type="text" name="birth_date" inputmode="numeric" autocomplete="bday" placeholder="gg/mm/aaaa" pattern="[0-9]{2}/[0-9]{2}/[0-9]{4}" maxlength="10" required>
         </label>
         <label>
           Email
@@ -61,5 +61,11 @@
       </div>
     </section>
   </main>
+  <script>
+    document.querySelector('[name="birth_date"]').addEventListener('input', (event) => {
+      const digits = event.target.value.replace(/\D/g, '').slice(0, 8);
+      event.target.value = [digits.slice(0, 2), digits.slice(2, 4), digits.slice(4)].filter(Boolean).join('/');
+    });
+  </script>
 </body>
 </html>

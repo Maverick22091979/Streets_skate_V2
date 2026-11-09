@@ -98,6 +98,8 @@ class Route(Base):
     connection_id: Mapped[int] = mapped_column(ForeignKey("auth_connections.id", ondelete="CASCADE"), nullable=False)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    publication_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    publication_consent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     import_user_label: Mapped[str | None] = mapped_column(String(255))
     name: Mapped[str | None] = mapped_column(String(255))
     sport_type: Mapped[str | None] = mapped_column(String(100))

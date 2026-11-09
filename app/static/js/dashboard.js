@@ -3,10 +3,10 @@ const summaryGrid = document.getElementById('summaryGrid');
 const statusText = document.getElementById('statusText');
 const reloadBtn = document.getElementById('reloadRoutes');
 const importBtn = document.getElementById('importRoutes');
-const provider = importBtn?.dataset?.provider || '';
-const isReadOnly = (importBtn?.dataset?.readOnly || 'false') === 'true';
-const importAllowed = (importBtn?.dataset?.importAllowed || 'true') === 'true';
-const importAutostart = (importBtn?.dataset?.importAutostart || 'false') === 'true';
+const provider = statusText?.dataset?.provider || '';
+const isReadOnly = (statusText?.dataset?.readOnly || 'false') === 'true';
+const importAllowed = (statusText?.dataset?.importAllowed || 'true') === 'true';
+const importAutostart = (statusText?.dataset?.importAutostart || 'false') === 'true';
 const resetFiltersBtn = document.getElementById('resetFilters');
 const weightsGrid = document.getElementById('weightsGrid');
 const weightsTotal = document.getElementById('weightsTotal');
@@ -50,6 +50,12 @@ const importFooterLabel = document.getElementById('importFooterLabel');
 const importFooterValue = document.getElementById('importFooterValue');
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
 const isAdmin = provider === 'admin' || Boolean(saveWeightsBtn || saveDuplicateSettingsBtn || saveSlopeSettingsBtn);
+const routeSelection = document.getElementById('routeSelection');
+const personalOwnerId = Number(routeSelection?.dataset?.ownerId || 0);
+const selectAllPersonalRoutes = document.getElementById('selectAllPersonalRoutes');
+const publishSelectedRoutes = document.getElementById('publishSelectedRoutes');
+const selectionStatus = document.getElementById('selectionStatus');
+const selectedRouteIds = new Set();
 let allRoutes = [];
 let importPulse = null;
 let importFooterTimer = null;
@@ -270,6 +276,7 @@ function renderRoutes(routes) {
   grid.innerHTML = filtered.map(renderRoute).join('');
   bindRouteCards();
   bindDeleteButtons();
+  bindRouteSelection();
   return filtered;
 }
 
@@ -278,7 +285,7 @@ function updateRoutesProgress(found, total) {
   const safeFound = Math.max(0, Number(found || 0));
   const safeTotal = Math.max(0, Number(total || 0));
   const pct = safeTotal > 0 ? Math.round((safeFound / safeTotal) * 100) : 0;
-  routesProgressLabel.textContent = safeTotal > 0 ? 'Percorsi trovati' : 'Percorsi trovati in cache';
+  routesProgressLabel.textContent = safeTotal > 0 ? 'Percorsi trovati' : 'Percorsi trovati nel database';
   routesProgressValue.textContent = `${safeFound} / ${safeTotal}`;
   routesProgressFill.max = 100;
   routesProgressFill.value = pct;
@@ -382,7 +389,7 @@ function resetFilters() {
     el.value = '';
   });
   const filtered = renderRoutes(allRoutes);
-  statusText.textContent = filtered.length ? `${filtered.length} percorsi in cache locale` : 'Nessun percorso in cache.';
+  statusText.textContent = filtered.length ? `${filtered.length} percorsi nel database` : 'Nessun percorso nel database.';
 }
 
 function shortSkipMessage(count, names) {
@@ -401,8 +408,6 @@ function renderRoute(route) {
   const d = route.difficulty || {};
   const f = d.factors || {};
   const dd = d.declared_difficulty || null;
-  const trackQuality = route.enrichment?.track_quality || {};
-  const trackAlignment = route.enrichment?.track_alignment || {};
   const routeId = safeNum(route.id, 0);
   const score = safeNum(d.score, 0);
   const scoreLabel = escapeHtml(d.label || '');
@@ -428,7 +433,7 @@ function renderRoute(route) {
           </h2>
           <p>${type} · ${startDate}</p>
         </div>
-        ${isAdmin ? `<div class="route-actions"><button class="route-delete" type="button" data-route-id="${routeId}">Cancella</button></div>` : ''}
+        ${isAdmin ? `<div class="route-actions"><label class="route-select-label"><input class="route-select" type="checkbox" data-route-id="${routeId}" ${selectedRouteIds.has(routeId) ? 'checked' : ''} ${personalOwnerId && Number(route.import_user_id) === personalOwnerId ? '' : 'disabled'}> Seleziona</label><button class="route-delete" type="button" data-route-id="${routeId}">Cancella</button></div>` : ''}
       </div>
 
       <div class="route-compact-metrics">
@@ -440,7 +445,7 @@ function renderRoute(route) {
       <div class="route-compact-meta">
         <span>${safeText(route.import_user_label)}</span>
         <span>${safeText(route.source_label)}</span>
-        <span class="${trackQuality.status === 'warning' || trackAlignment.status === 'warning' ? 'route-alert' : ''}">${trackQuality.status === 'warning' || trackAlignment.status === 'warning' ? 'Verifica traccia' : 'Traccia verificata'}</span>
+        ${isAdmin && !route.official_reviewed ? `<a class="header-link" href="${href}">Verifica percorso</a>` : ''}
         <strong>Apri dettagli</strong>
       </div>
     </article>
@@ -485,7 +490,7 @@ function bindDeleteButtons() {
         renderUserFilter(data.users || []);
         allRoutes = data.routes || [];
         const filtered = renderRoutes(allRoutes);
-        statusText.textContent = filtered.length ? `Percorso eliminato. Totale cache: ${data.total_cached}` : 'Nessun percorso in cache.';
+        statusText.textContent = filtered.length ? `Percorso eliminato. Totale nel database: ${data.total_cached}` : 'Nessun percorso nel database.';
       } catch (err) {
         statusText.textContent = `Errore: ${err.message}`;
         btn.disabled = false;
@@ -498,7 +503,7 @@ function bindRouteCards() {
   document.querySelectorAll('.route-card[data-route-href]').forEach(card => {
     const open = () => { window.location.assign(card.dataset.routeHref); };
     card.addEventListener('click', (event) => {
-      if (!event.target.closest('button, a, input, select, textarea')) open();
+      if (!event.target.closest('button, a, label, input, select, textarea')) open();
     });
     card.addEventListener('keydown', (event) => {
       if (event.target !== card) return;
@@ -509,6 +514,56 @@ function bindRouteCards() {
     });
   });
 }
+
+function updateRouteSelection() {
+  if (!selectAllPersonalRoutes) return;
+  const personal = allRoutes.filter(route => personalOwnerId && Number(route.import_user_id) === personalOwnerId);
+  const ids = new Set(personal.map(route => Number(route.id)));
+  for (const id of selectedRouteIds) if (!ids.has(id)) selectedRouteIds.delete(id);
+  selectAllPersonalRoutes.disabled = !personal.length;
+  selectAllPersonalRoutes.checked = personal.length > 0 && selectedRouteIds.size === personal.length;
+  selectAllPersonalRoutes.indeterminate = selectedRouteIds.size > 0 && !selectAllPersonalRoutes.checked;
+  publishSelectedRoutes.disabled = selectedRouteIds.size === 0;
+  publishSelectedRoutes.hidden = selectedRouteIds.size === 0;
+  selectionStatus.textContent = selectedRouteIds.size ? `${selectedRouteIds.size} percorsi selezionati` : '';
+}
+
+function bindRouteSelection() {
+  document.querySelectorAll('.route-select').forEach(box => {
+    box.addEventListener('change', () => {
+      const id = Number(box.dataset.routeId);
+      if (box.checked) selectedRouteIds.add(id); else selectedRouteIds.delete(id);
+      updateRouteSelection();
+    });
+  });
+  updateRouteSelection();
+}
+
+selectAllPersonalRoutes?.addEventListener('change', () => {
+  selectedRouteIds.clear();
+  if (selectAllPersonalRoutes.checked) allRoutes.forEach(route => {
+    if (personalOwnerId && Number(route.import_user_id) === personalOwnerId) selectedRouteIds.add(Number(route.id));
+  });
+  renderRoutes(allRoutes);
+});
+
+publishSelectedRoutes?.addEventListener('click', async () => {
+  publishSelectedRoutes.disabled = true;
+  try {
+    const response = await fetch('/api/admin/routes/publication', {
+      method: 'POST', headers: { ...csrfHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify([...selectedRouteIds]),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Operazione non riuscita');
+    selectedRouteIds.clear();
+    renderRoutes(allRoutes);
+    selectionStatus.textContent = `Visibilità abilitata per ${data.published} percorsi.`;
+  } catch (err) {
+    selectionStatus.textContent = `Errore: ${err.message}`;
+    publishSelectedRoutes.disabled = false;
+  }
+});
 
 function readWeights() {
   const out = {};
@@ -989,8 +1044,8 @@ async function uploadGpx(ev) {
     const shortMsg = shortSkipMessage(skippedShort, skippedShortNames);
     const wrongTypeMsg = wrongTypeSkipMessage(skippedWrongType, skippedWrongTypeNames);
     const bundleMsg = `${processedBundles} bundle GPX/JSON`;
-    statusText.textContent = `Importati ${imported} percorsi da ${bundleMsg}. Scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}. Totale cache: ${totalCached}`;
-    if (gpxUploadState) gpxUploadState.textContent = `Import completato: ${imported} percorsi da ${bundleMsg}, scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}, totale cache ${totalCached}`;
+    statusText.textContent = `Importati ${imported} percorsi da ${bundleMsg}. Scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}. Totale nel database: ${totalCached}`;
+    if (gpxUploadState) gpxUploadState.textContent = `Import completato: ${imported} percorsi da ${bundleMsg}, scartati nome file=${skippedFilename}${shortMsg}${wrongTypeMsg}, totale nel database ${totalCached}`;
     gpxUploadForm.reset();
   } catch (err) {
     if (processedBundles > 0) await loadRoutes();
@@ -1008,7 +1063,7 @@ async function loadRoutes() {
   if (reloadBtn?.disabled) return;
   const end = window.sessionGuard?.beginTask() || (() => {});
   if (reloadBtn) reloadBtn.disabled = true;
-  statusText.textContent = 'Caricamento cache locale...';
+  statusText.textContent = 'Caricamento percorsi dal database...';
   try {
     const loaded = new Map();
     let after = 0;
@@ -1018,7 +1073,7 @@ async function loadRoutes() {
       const data = await readImportResponse(response);
       if (after === 0) users = data.users || [];
       for (const route of data.routes || []) loaded.set(route.id, route);
-      statusText.textContent = `Caricamento cache locale: ${loaded.size} percorsi...`;
+      statusText.textContent = `Caricamento dal database: ${loaded.size} percorsi...`;
       if (!data.has_more) break;
       const next = Number(data.next_after);
       if (!Number.isFinite(next) || next <= after) throw new Error('Avanzamento del caricamento non valido. Riprova.');
@@ -1030,16 +1085,16 @@ async function loadRoutes() {
     if (provider === 'admin') {
       const filtered = renderRoutes(allRoutes);
       statusText.textContent = filtered.length ? `${filtered.length} percorsi in archivio` : 'Admin: nessun percorso disponibile.';
-      importBtn.disabled = true;
+      if (importBtn) importBtn.disabled = true;
       return;
     }
     if (!routes.length) {
       renderRoutes(allRoutes);
-      statusText.textContent = isReadOnly ? 'Archivio globale vuoto o non ancora popolato.' : importAllowed ? 'Nessun percorso in cache. Premi “Importa”.' : 'Nessun percorso in cache. Import disabilitato per mancato consenso.';
+      statusText.textContent = isReadOnly ? 'Archivio globale vuoto o non ancora popolato.' : importAllowed ? 'Nessun percorso nel database. Premi “Importa”.' : 'Nessun percorso nel database. Import disabilitato per mancato consenso.';
       return;
     }
     const filtered = renderRoutes(allRoutes);
-    statusText.textContent = isReadOnly ? `${filtered.length} percorsi disponibili in archivio globale` : `${filtered.length} percorsi in cache locale`;
+    statusText.textContent = isReadOnly ? `${filtered.length} percorsi disponibili in archivio globale` : `${filtered.length} percorsi nel database`;
   } catch (err) {
     statusText.textContent = `Errore: ${err.message}`;
   } finally {
@@ -1066,7 +1121,7 @@ async function importRoutes() {
     data = await pollImportJob(startData.job_id);
     allRoutes = data.routes || [];
     renderRoutes(allRoutes);
-    statusText.textContent = `Importati ${data.imported} percorsi${shortSkipMessage(data.skipped_short || 0, data.skipped_short_names || [])}. Totale cache: ${data.total_cached}`;
+    statusText.textContent = `Importati ${data.imported} percorsi${shortSkipMessage(data.skipped_short || 0, data.skipped_short_names || [])}. Totale nel database: ${data.total_cached}`;
     if (data.warnings?.length) statusText.textContent += ` Avvisi: ${data.warnings.join(' ')}`;
     setImportFooter(data.imported || 0, data.total || 0, `Import ${provider} completato`);
     hideImportFooter(8000);
@@ -1116,19 +1171,19 @@ if (grid) {
   if (provider === 'admin') {
     const filtered = renderRoutes(allRoutes);
     statusText.textContent = filtered.length ? `${filtered.length} percorsi in archivio` : 'Admin: nessun percorso disponibile.';
-    importBtn.disabled = true;
+    if (importBtn) importBtn.disabled = true;
   } else if (!allRoutes.length) {
     renderRoutes(allRoutes);
     statusText.textContent = isReadOnly
       ? 'Archivio globale vuoto o non ancora popolato.'
       : importAllowed
-      ? 'Nessun percorso in cache per l\'utente loggato. Premi "Importa".'
-      : 'Nessun percorso in cache per l\'utente loggato. Import disabilitato per mancato consenso.';
+      ? 'Nessun percorso nel database per l\'utente loggato. Premi "Importa".'
+      : 'Nessun percorso nel database per l\'utente loggato. Import disabilitato per mancato consenso.';
   } else {
     const filtered = renderRoutes(allRoutes);
     statusText.textContent = isReadOnly
       ? `${filtered.length} percorsi disponibili in archivio globale`
-      : `${filtered.length} percorsi in cache per l'utente loggato`;
+      : `${filtered.length} percorsi nel database per l'utente loggato`;
   }
   if (importAutostart && importAllowed && !importConsentModal?.classList.contains('hidden')) {
     hideImportFooter();

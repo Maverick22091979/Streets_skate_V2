@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{ csrf_token }}">
-  <title>Richieste utenti - {{ app_name }}</title>
+  <title>Utenti - {{ app_name }}</title>
   <link rel="stylesheet" href="/static/css/login.css?v={{ asset_version }}">
 </head>
 <body>
@@ -13,7 +13,7 @@
       <div class="dashboard-header">
         <div>
           <a class="back-link" href="/settings">Torna alle settings</a>
-          <h1>Street Skate · Richieste utenti</h1>
+          <h1>Street Skate · Utenti</h1>
           <p>Notifiche pendenti: <strong>{{ pending_registration_count }}</strong></p>
         </div>
         <div class="header-actions">
@@ -33,6 +33,39 @@
       {% if status %}
       <div class="notice">{{ status }}</div>
       {% endif %}
+
+      <section class="admin-panel" id="utenti">
+        <div class="admin-panel-head"><div>
+          <h2>Utenti registrati</h2>
+          <p>Per gli account locali puoi impostare una password temporanea: l'utente dovrà cambiarla al prossimo accesso. Le password esistenti non sono visibili.</p>
+        </div></div>
+        {% if account_status %}<div class="notice" role="status">{{ account_status }}</div>{% endif %}
+        <div class="route-type-table-wrap"><table class="route-type-table">
+          <thead><tr><th>Nome</th><th>Username</th><th>Email</th><th>Accesso</th><th>Stato</th><th>Password locale</th></tr></thead>
+          <tbody>
+          {% for account in accounts %}
+          <tr>
+            <td>{{ account.display_name or ((account.first_name or '') ~ ' ' ~ (account.last_name or '')) | trim or '—' }}</td>
+            <td>{{ account.username or '—' }}</td><td>{{ account.email or '—' }}</td>
+            <td>{% set providers = account.connections | map(attribute='provider') | reject('in', ['local', 'manual']) | list %}{% if account.username and account.password_hash %}Locale{% if providers %}, {% endif %}{% endif %}{{ providers | join(', ') }}{% if not providers and not (account.username and account.password_hash) %}Non associato a un accesso{% endif %}</td>
+            <td>{{ 'Attivo' if account.is_active else 'Disattivato' }}</td>
+            <td>{% if account.username and account.password_hash %}
+              <details><summary>Imposta password</summary>
+                <form method="post" action="/admin/users/{{ account.id }}/password" class="admin-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <label>Nuova password <input type="password" name="new_password" autocomplete="new-password" minlength="8" required></label>
+                  <label>Conferma password <input type="password" name="confirm_password" autocomplete="new-password" minlength="8" required></label>
+                  <small>Almeno 8 caratteri, una maiuscola, una minuscola, un numero e un simbolo.</small>
+                  <button type="submit">Salva password</button>
+                </form>
+              </details>
+            {% else %}Non disponibile{% endif %}</td>
+          </tr>
+          {% endfor %}
+          {% if not accounts %}<tr><td colspan="6">Nessun utente registrato.</td></tr>{% endif %}
+          </tbody>
+        </table></div>
+      </section>
 
       <section class="admin-panel">
         <div class="admin-panel-head">

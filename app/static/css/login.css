@@ -563,6 +563,13 @@ code {
 .route-link:hover { text-decoration: underline; }
 .route-top p { margin: 0; color: #667085; }
 .route-actions { display: flex; flex-direction: column; gap: 10px; align-items: flex-end; }
+.route-select-label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.route-select-label input { width: auto; margin: 0; }
+.routes-column { min-width: 0; }
+.route-selection { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0 0 12px; }
+.route-selection > .route-select-label { margin-left: auto; order: 1; }
+.route-selection button { padding: 8px 12px; }
+#publishSelectedRoutes:disabled { opacity: .55; cursor: not-allowed; }
 .route-delete { background: #b42318; padding: 10px 14px; border-radius: 12px; font-size: 13px; }
 .route-delete:disabled { opacity: .55; cursor: not-allowed; }
 .route-compact-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 14px 0 10px; }

@@ -27,8 +27,8 @@
         <div class="official-total" aria-label="Candidature totali"><strong>{{ candidates|length }}</strong><span>candidature</span></div>
       </header>
       <section class="admin-panel calendar-panel">
-        <div><span class="panel-eyebrow">Fonte eventi</span><h2>Google Calendar</h2><p>{% if calendar_configured %}Calendario configurato e pronto per la sincronizzazione.{% else %}Manca GOOGLE_CALENDAR_API_KEY: aggiungila al file di configurazione per poter sincronizzare gli eventi.{% endif %}</p></div>
-        <div class="calendar-actions"><button id="calendarSync" {% if not calendar_configured %}disabled{% endif %}>Sincronizza eventi</button><span id="calendarResult" class="calendar-result" role="status" aria-live="polite"></span></div>
+        <div><span class="panel-eyebrow">Fonte eventi</span><h2>Google Calendar</h2><p>{% if calendar_configured %}Sincronizza gli eventi anno per anno, dal percorso più vecchio a oggi, e rivaluta le candidature. Le decisioni già approvate o rifiutate restano invariate.{% else %}Manca GOOGLE_CALENDAR_API_KEY: aggiungila al file di configurazione per poter sincronizzare gli eventi.{% endif %}</p></div>
+        <div class="calendar-actions"><button id="calendarSync" type="button" {% if not calendar_configured %}disabled{% endif %}>Sincronizza eventi e percorsi</button><span id="calendarResult" class="calendar-result" role="status" aria-live="polite"></span></div>
       </section>
       {% if status %}<div class="notice">{{ status }}</div>{% endif %}
       <section class="official-summary" aria-label="Riepilogo candidature">

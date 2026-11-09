@@ -30,7 +30,7 @@
       <div class="auth-strip">
         <div class="oauth-list">
           {% if providers.adidas.button_visible %}
-          <a class="oauth-btn adidas {% if not providers.adidas.button_enabled %}disabled{% endif %}" {% if providers.adidas.button_enabled %}href="/auth/adidas{% if fresh_login %}?fresh=1{% endif %}"{% else %}aria-disabled="true"{% endif %}>
+          <a class="oauth-btn adidas disabled" aria-disabled="true">
             <span class="logo">▲</span>
             <span class="oauth-label">adidas Running</span>
           </a>
@@ -44,35 +44,35 @@
           {% endif %}
 
           {% if providers.mapmyrun.button_visible %}
-          <a class="oauth-btn mapmyrun {% if not providers.mapmyrun.button_enabled %}disabled{% endif %}" {% if providers.mapmyrun.button_enabled %}href="/auth/mapmyrun{% if fresh_login %}?fresh=1{% endif %}"{% else %}aria-disabled="true"{% endif %}>
+          <a class="oauth-btn mapmyrun disabled" aria-disabled="true">
             <span class="logo">M</span>
             <span class="oauth-label">MapMyRun</span>
           </a>
           {% endif %}
 
           {% if providers.suunto.button_visible %}
-          <a class="oauth-btn suunto {% if not providers.suunto.button_enabled %}disabled{% endif %}" {% if providers.suunto.button_enabled %}href="/auth/suunto{% if fresh_login %}?fresh=1{% endif %}"{% else %}aria-disabled="true"{% endif %}>
+          <a class="oauth-btn suunto disabled" aria-disabled="true">
             <span class="logo">S</span>
             <span class="oauth-label">Suunto</span>
           </a>
           {% endif %}
 
           {% if providers.runkeeper.button_visible %}
-          <a class="oauth-btn runkeeper {% if not providers.runkeeper.button_enabled %}disabled{% endif %}" {% if providers.runkeeper.button_enabled %}href="/auth/runkeeper{% if fresh_login %}?fresh=1{% endif %}"{% else %}aria-disabled="true"{% endif %}>
+          <a class="oauth-btn runkeeper disabled" aria-disabled="true">
             <span class="logo">R</span>
             <span class="oauth-label">Runkeeper</span>
           </a>
           {% endif %}
 
           {% if providers.garmin.button_visible %}
-          <a class="oauth-btn garmin {% if not providers.garmin.button_enabled %}disabled{% endif %}" {% if providers.garmin.button_enabled %}href="/auth/garmin{% if fresh_login %}?fresh=1{% endif %}"{% else %}aria-disabled="true"{% endif %}>
+          <a class="oauth-btn garmin disabled" aria-disabled="true">
             <span class="logo">G</span>
             <span class="oauth-label">Garmin Connect</span>
           </a>
           {% endif %}
 
           {% if providers.inline_route_tracking.button_visible %}
-          <a class="oauth-btn inline-route-tracking {% if not providers.inline_route_tracking.button_enabled %}disabled{% endif %}" {% if providers.inline_route_tracking.button_enabled %}href="/auth/inline_route_tracking{% if fresh_login %}?fresh=1{% endif %}"{% else %}aria-disabled="true"{% endif %}>
+          <a class="oauth-btn inline-route-tracking disabled" aria-disabled="true">
             <span class="logo">I</span>
             <span class="oauth-label">Inline Route Tracking</span>
           </a>
@@ -102,58 +102,8 @@
         </div>
 
         <aside class="provider-notes">
-          <h2>Stato provider</h2>
-          <div class="provider-note-list">
-            {% if providers.adidas.button_visible %}
-            <article class="provider-note">
-              <strong>adidas Running</strong>
-              <small>{% if providers.adidas.button_enabled and providers.adidas.oauth_configured %}Apre login ufficiale{% elif providers.adidas.button_enabled %}Pulsante abilitato ma OAuth non configurato{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.adidas.implementation.login }} · Auth: {{ providers.adidas.implementation.auth }} · Settings Secrets: {{ providers.adidas.implementation.settings }}</small>
-            </article>
-            {% endif %}
-            {% if providers.strava.button_visible %}
-            <article class="provider-note">
-              <strong>Strava</strong>
-              <small>{% if providers.strava.button_enabled %}Apre login ufficiale{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.strava.implementation.login }} · Auth: {{ providers.strava.implementation.auth }} · Settings Secrets: {{ providers.strava.implementation.settings }}</small>
-            </article>
-            {% endif %}
-            {% if providers.mapmyrun.button_visible %}
-            <article class="provider-note">
-              <strong>MapMyRun</strong>
-              <small>{% if providers.mapmyrun.button_enabled and providers.mapmyrun.oauth_configured %}Apre login ufficiale{% elif providers.mapmyrun.button_enabled %}Pulsante abilitato ma OAuth non configurato{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.mapmyrun.implementation.login }} · Auth: {{ providers.mapmyrun.implementation.auth }} · Settings Secrets: {{ providers.mapmyrun.implementation.settings }}</small>
-            </article>
-            {% endif %}
-            {% if providers.suunto.button_visible %}
-            <article class="provider-note">
-              <strong>Suunto</strong>
-              <small>{% if providers.suunto.button_enabled and providers.suunto.oauth_configured %}Apre login ufficiale{% elif providers.suunto.button_enabled %}Pulsante abilitato ma OAuth non configurato{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.suunto.implementation.login }} · Auth: {{ providers.suunto.implementation.auth }} · Settings Secrets: {{ providers.suunto.implementation.settings }}</small>
-            </article>
-            {% endif %}
-            {% if providers.runkeeper.button_visible %}
-            <article class="provider-note">
-              <strong>Runkeeper</strong>
-              <small>{% if providers.runkeeper.button_enabled and providers.runkeeper.oauth_configured %}Apre login ufficiale{% elif providers.runkeeper.button_enabled %}Pulsante abilitato ma OAuth non configurato{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.runkeeper.implementation.login }} · Auth: {{ providers.runkeeper.implementation.auth }} · Settings Secrets: {{ providers.runkeeper.implementation.settings }}</small>
-            </article>
-            {% endif %}
-            {% if providers.garmin.button_visible %}
-            <article class="provider-note">
-              <strong>Garmin Connect</strong>
-              <small>{% if providers.garmin.button_enabled and providers.garmin.oauth_configured %}Apre login ufficiale{% elif providers.garmin.button_enabled %}Pulsante abilitato ma OAuth non configurato{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.garmin.implementation.login }} · Auth: {{ providers.garmin.implementation.auth }} · Settings Secrets: {{ providers.garmin.implementation.settings }}</small>
-            </article>
-            {% endif %}
-            {% if providers.inline_route_tracking.button_visible %}
-            <article class="provider-note">
-              <strong>Inline Route Tracking</strong>
-              <small>{% if providers.inline_route_tracking.button_enabled and providers.inline_route_tracking.oauth_configured %}Apre login ufficiale{% elif providers.inline_route_tracking.button_enabled %}Predisposto, in attesa API ufficiali{% else %}Pulsante disabilitato da admin{% endif %}</small>
-              <small>Login: {{ providers.inline_route_tracking.implementation.login }} · Auth: {{ providers.inline_route_tracking.implementation.auth }} · Settings Secrets: {{ providers.inline_route_tracking.implementation.settings }}</small>
-            </article>
-            {% endif %}
-          </div>
+          <h2>Accesso con i tracker</h2>
+          <p>Per ora è abilitato solo l'accesso tramite Strava. Gli altri tracker saranno abilitati non appena possibile.</p>
         </aside>
       </div>
 
@@ -162,7 +112,7 @@
           {% if fresh_login %}
           <p class="footer-note">Sessione locale chiusa. Il prossimo click su un provider riavvia il flusso di login relativo.</p>
           {% endif %}
-          <p class="footer-note">I pulsanti provider aprono la pagina ufficiale di login e autorizzazione. L'utente inserisce lì le credenziali e l'app riceve poi il token API nel callback backend. L'eventuale export locale adidas è separato dal login OAuth.</p>
+          <p class="footer-note">L'accesso tramite Strava apre la pagina ufficiale di login e autorizzazione.</p>
         </div>
         <div class="footer-timestamp">{{ now_label }}</div>
       </footer>

@@ -132,14 +132,13 @@ class CoverageApiTests(unittest.TestCase):
             self.assertEqual(data["mapped_routes"], 1)
             self.assertEqual(counts(data), {1})
 
-    def test_provider_session_can_read_global_archive(self):
+    def test_provider_session_can_read_visible_archive(self):
         from unittest.mock import Mock
 
         db = Mock()
         db.execute.return_value = []
         app.dependency_overrides[get_db] = lambda: db
-        with patch("app.main._get_session_user", return_value=(object(), object())), \
-             patch("app.main._coverage_cache.get", return_value=(build_coverage([]), 200)):
+        with patch("app.main._get_session_user", return_value=(type("User", (), {"id": 1})(), object())):
             self.assertEqual(self.client.get("/coverage").status_code, 200)
             self.assertEqual(self.client.get("/api/coverage").status_code, 200)
 

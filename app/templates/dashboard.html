@@ -26,7 +26,7 @@
           {% if user.is_admin %}
           <a class="header-link" href="/settings">Settings</a>
           <a class="header-link" href="/admin/official-skates">Pattinate ufficiali</a>
-          <a class="header-link" href="/admin/registrations">Richieste utenti</a>
+          <a class="header-link" href="/admin/registrations">Utenti</a>
           <a class="header-link" href="/admin/route-types">Tipologia percorsi</a>
           <a class="header-link" href="/admin/logs">Log azioni</a>
           <a class="header-link" href="/admin/request-debug">Debug richiesta</a>
@@ -38,13 +38,9 @@
         </div>
       </div>
 
-      <div class="notice">
-        I percorsi vengono importati dal provider connesso e salvati su Postgres. L'indice difficoltà usa pendenza max, pendenza media ponderata, pavimentazione, pressione atmosferica, temperatura e velocita massima storica sul tratto. I dati mancanti restano predisposti per arricchimento successivo.
-      </div>
-
       {% if not user.is_admin and user.read_only and not user.import_allowed %}
       <div class="notice consent-warning">
-        Archivio globale in sola lettura. Dopo il login provider puoi consultare tutti i percorsi e i relativi punteggi, ma import e cancellazione restano riservati all'admin.
+        Puoi consultare i tuoi percorsi e quelli pubblicati con il consenso dei proprietari. Import e cancellazione restano riservati all'admin.
       </div>
       {% elif not user.is_admin and user.import_allowed %}
       <div class="notice">
@@ -57,11 +53,12 @@
       {% endif %}
 
       <div class="toolbar">
-        <button id="importRoutes" data-provider="{{ user.provider_key }}" data-read-only="{{ 'true' if user.read_only else 'false' }}" data-import-allowed="{{ 'true' if user.is_admin or user.import_allowed else 'false' }}" data-import-autostart="{{ 'true' if user.import_autostart else 'false' }}" {% if not user.is_admin and not user.import_allowed %}disabled{% endif %}>
-          {% if user.provider_key == "admin" %}Import non disponibile{% elif not user.import_allowed %}Import disabilitato{% else %}Importa da {{ user.provider_label }}{% endif %}
+        {% if not user.is_admin %}
+        <button id="importRoutes" {% if not user.import_allowed %}disabled{% endif %}>
+          {% if not user.import_allowed %}Import disabilitato{% else %}Importa da {{ user.provider_label }}{% endif %}
         </button>
-        <button id="reloadRoutes">Ricarica cache locale</button>
-        <span id="statusText">Caricamento...</span>
+        {% endif %}
+        <span id="statusText" data-provider="{{ user.provider_key }}" data-read-only="{{ 'true' if user.read_only else 'false' }}" data-import-allowed="{{ 'true' if user.is_admin or user.import_allowed else 'false' }}" data-import-autostart="{{ 'true' if user.import_autostart else 'false' }}">Caricamento...</span>
       </div>
 
       <div id="routesProgress" class="routes-progress" aria-live="polite">
@@ -79,7 +76,7 @@
         <div class="admin-panel-head">
           <div>
             <h2>Import GPX</h2>
-            <p>Carica file GPX e, facoltativamente, i JSON omonimi. Per l'export adidas seleziona i file nella cartella Sport-sessions/GPS-data.</p>
+            <p>I dati dei GPX importati vengono salvati nel database. Puoi caricare anche i JSON omonimi; per l'export adidas seleziona i file nella cartella Sport-sessions/GPS-data.</p>
           </div>
         </div>
         <form id="gpxUploadForm" class="gpx-upload" method="post" enctype="multipart/form-data" action="/dashboard/import-gpx">
@@ -182,7 +179,16 @@
             </div>
           </section>
         </aside>
-        <div id="routesGrid" class="routes-grid"></div>
+        <div class="routes-column">
+          {% if user.is_admin %}
+          <div id="routeSelection" class="route-selection" data-owner-id="{{ personal_owner_id or '' }}">
+            <label class="route-select-label" title="Seleziona tutti i tuoi percorsi, anche quelli nascosti dai filtri"><input id="selectAllPersonalRoutes" type="checkbox"> Seleziona Tutti</label>
+            <span id="selectionStatus" aria-live="polite"></span>
+            <button id="publishSelectedRoutes" type="button" title="Condividi i percorsi selezionati con gli utenti autenticati" disabled hidden>Abilita visibilità</button>
+          </div>
+          {% endif %}
+          <div id="routesGrid" class="routes-grid"></div>
+        </div>
       </section>
     </section>
   </main>

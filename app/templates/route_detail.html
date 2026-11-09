@@ -23,6 +23,36 @@
         </form>
       </div>
 
+      {% if is_owner %}
+      <section class="admin-panel" aria-label="Visibilità percorso">
+        <h2>Visibilità percorso</h2>
+        <p>{% if publication_approved and publication_consent %}Visibile agli utenti registrati.{% elif publication_approved %}In attesa del consenso del proprietario.{% elif publication_consent %}Consenso ricevuto, in attesa dell'approvazione dell'amministratore.{% else %}Visibile solo al proprietario e agli amministratori.{% endif %}</p>
+        {% if publication_status %}<p role="status">Visibilità aggiornata.</p>{% endif %}
+        <form method="post" action="/routes/{{ route.id }}/publication">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          {% if user.is_admin %}
+          {% set can_disable = publication_approved and (publication_consent or not is_owner) %}
+          <button name="action" value="{{ 'unapprove' if can_disable else 'approve' }}" type="submit">{{ 'Disabilita visibilità' if can_disable else 'Abilita visibilità' }}</button>
+          {% if is_owner %}<p>Abilitando la visibilità acconsenti a condividere il tuo percorso con gli utenti autenticati.</p>{% else %}<p>La visibilità richiede il consenso del proprietario.</p>{% endif %}
+          {% elif is_owner %}
+          <button name="action" value="{{ 'withdraw' if publication_consent else 'consent' }}" type="submit">{{ 'Disabilita visibilità' if publication_consent else 'Abilita visibilità' }}</button>
+          <p>Il percorso completo sarà visibile agli utenti autenticati. Puoi revocare il consenso in qualsiasi momento.</p>
+          {% endif %}
+        </form>
+      </section>
+      {% endif %}
+      {% if user.is_admin and (not official_candidate or official_candidate.status not in ['approved', 'rejected']) %}
+      <section class="admin-panel" aria-label="Verifica pattinata ufficiale">
+        <h2>Verifica percorso</h2>
+        <p>Decidi se questo percorso è una pattinata ufficiale. La decisione è indipendente dalla visibilità scelta dal proprietario.</p>
+        {% if official_candidate %}<p><a href="/admin/official-skates/{{ official_candidate.id }}">Esamina il segmento e l'esito automatico</a></p>{% endif %}
+        <form method="post" action="/routes/{{ route.id }}/official-review">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" name="decision" value="approved">Valida come pattinata ufficiale</button>
+          <button type="submit" name="decision" value="rejected">Non è una pattinata ufficiale</button>
+        </form>
+      </section>
+      {% endif %}
       <section class="viewer-shell">
         <div class="viewer-map-card">
           <div id="routeMap" class="route-map"></div>
